@@ -5679,6 +5679,20 @@ impl HostList {
                         batch.card_fills.push((chunk, at, shadow, src, len));
                         continue;
                     }
+                    if fills_from_copies()
+                        && let Some(shadow) = crate::shadow::find(src as u64, len as u64)
+                        && !shadow.in_place()
+                        && shadow.left(src as u64) >= len as u64
+                    {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Copies, 1);
+                            add(C::CopyBytes, len as u64);
+                        }
+                        batch.add(&shadow, src, len);
+                        batch.fills.push((dst, shadow, src, len));
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -5785,6 +5799,10 @@ struct Batch {
     /// lists: the chunk's buffer, the offset in it, the source's host copy,
     /// the source and the bytes.
     card_fills: Vec<(ID3D12Resource, u64, std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Fills of upload memory taken from their source's host copy once its
+    /// refresh is done ([`fills_from_copies`]): the destination, the copy,
+    /// the source and the bytes.
+    fills: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -5879,7 +5897,32 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        // The fills whose sources are now up to date in their copies.
+        if !self.fills.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            for (dst, shadow, src, len) in self.fills.drain(..) {
+                // SAFETY: scratch memory of the list, and the copy's
+                // mapping; `len` lies in both (checked when recorded).
+                unsafe { std::ptr::copy_nonoverlapping(shadow.host_bytes(src as u64), dst as *mut u8, len) };
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MoveUs, started.elapsed().as_micros() as u64);
+        }
     }
+}
+
+/// Whether fills of upload memory are taken from their source's host copy
+/// after its refresh, with a plain copy (`VICTORY_FILL_FROM_COPY`, on by
+/// default; `0`: read from title memory through the kernel, as before).
+///
+/// A frame of gameplay fills some 12,000 constant buffers, each a
+/// `ReadProcessMemory` call: "moves" of 45 ms a frame on the submitting
+/// thread (run s18). The copy is what every shader read of the buffer uses,
+/// brought up to date by the same refresh.
+fn fills_from_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_FROM_COPY").is_none_or(|v| v != "0"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their

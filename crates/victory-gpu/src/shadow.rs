@@ -1689,6 +1689,14 @@ impl Shadow {
         at != 0 && crate::frame::current() + 1 <= at + 2
     }
 
+    /// The copy's CPU-side bytes at a title address inside it (for a copy
+    /// in the card's memory, its CPU side): as up to date as the last
+    /// refresh of the range made them.
+    pub(crate) fn host_bytes(&self, address: u64) -> *const u8 {
+        // SAFETY: inside the mapping, for an address inside the copy.
+        unsafe { self.data.add((address - self.start) as usize).cast_const() }
+    }
+
     /// Whether this is title memory in place, not a copy ([`Shadow::placed`]).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()

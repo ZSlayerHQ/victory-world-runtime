@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// The frame ([`crate::frame::current`]) in which shaders were last
+    /// declared to write the copy, plus one (0: never).
+    declared: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1679,6 +1682,13 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether shaders were declared to write the copy in this frame or the
+    /// two before it.
+    pub(crate) fn gpu_written_lately(&self) -> bool {
+        let at = self.declared.load(Ordering::Relaxed);
+        at != 0 && crate::frame::current() + 1 <= at + 2
+    }
+
     /// Whether this is title memory in place, not a copy ([`Shadow::placed`]).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -1744,6 +1754,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            declared: AtomicU64::new(0),
         }
     }
 
@@ -1779,6 +1790,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        self.declared.store(crate::frame::current() + 1, Ordering::Relaxed);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 

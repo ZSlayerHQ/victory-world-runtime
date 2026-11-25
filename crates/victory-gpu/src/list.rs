@@ -831,12 +831,21 @@ fn card_copy(list: &crate::host::HostList, dst: usize, src: usize, len: u64) -> 
         return false;
     }
     let n = len as usize;
-    if !crate::host::shaders_may_write(list, src, src + n) && !crate::host::shaders_may_write(list, dst, dst + n) {
-        return false;
-    }
     let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len), crate::shadow::find(dst as u64, len)) else {
         return false;
     };
+    // Flights in the air now, the list's own shaders, or shaders that wrote
+    // either copy lately: a flight sent between this recording and the
+    // list's submission would make the copy at submission wait (run s18:
+    // 107 waits of ~100 ms for 2 KB copies out of a buffer shaders write
+    // every frame).
+    if !crate::host::shaders_may_write(list, src, src + n)
+        && !crate::host::shaders_may_write(list, dst, dst + n)
+        && !from.gpu_written_lately()
+        && !to.gpu_written_lately()
+    {
+        return false;
+    }
     // One buffer cannot be source and destination at once; title memory in
     // place is written behind write watching's back.
     if std::sync::Arc::ptr_eq(&from, &to) || from.in_place() || to.in_place() {

@@ -819,6 +819,9 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// The list for the fills of upload memory the card makes when this
+    /// list is first in a submission ([`card_fills`]).
+    fills: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -1378,6 +1381,51 @@ struct Scratch {
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
+impl Scratch {
+    /// The chunks' mapped spans and buffers, for [`card_fill`].
+    fn spans(&self) -> Vec<(usize, usize, ID3D12Resource)> {
+        self.chunks
+            .iter()
+            .map(|(c, size)| (c.data, c.data + *size as usize, c._buffer.clone()))
+            .collect()
+    }
+}
+
+/// Whether a fill of upload memory that reads title memory shaders of
+/// flights in the air may write is made by the card instead of waited for
+/// (`VICTORY_CARD_FILL`, on by default with [`late`]; `0`: waited for).
+/// The scratch chunks are then made where the card can copy into them
+/// ([`Host::scratch_buffer`]).
+///
+/// Run s18: fills of 48-byte constant buffers that lie in the title's
+/// 174 MB heap off 256-byte alignment (so not viewed in its host copy)
+/// were the biggest wait left, 137 waits of ~40 ms.
+fn card_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| late() && std::env::var_os("VICTORY_CARD_FILL").is_none_or(|v| v != "0"))
+}
+
+/// For a fill of `len` bytes of title memory at `src` into scratch memory
+/// at `dst` ([`Step::Fill`]): the chunk's buffer and the offset in it, and
+/// the host copy of the source, if the card can make the fill instead
+/// (`spans`: [`Scratch::spans`] of the list).
+fn card_fill(
+    spans: &[(usize, usize, ID3D12Resource)],
+    dst: usize,
+    src: usize,
+    len: usize,
+) -> Option<(ID3D12Resource, u64, std::sync::Arc<crate::shadow::Shadow>)> {
+    if !card_fills() || len == 0 {
+        return None;
+    }
+    let (from, _, buffer) = spans.iter().find(|(a, b, _)| *a <= dst && dst + len <= *b)?;
+    let shadow = crate::shadow::find(src as u64, len as u64)?;
+    if shadow.in_place() || shadow.left(src as u64) < len as u64 {
+        return None;
+    }
+    Some((buffer.clone(), (dst - from) as u64, shadow))
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.chunks));
@@ -1449,7 +1497,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = if card_fills() { host.scratch_buffer(size)? } else { host.upload_buffer(size)? };
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2210,6 +2258,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         return None;
     }
     for list in runs {
+        let spans = if card_fills() { list.scratch.lock().unwrap_or_else(|e| e.into_inner()).spans() } else { Vec::new() };
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
@@ -2223,7 +2272,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(dst, src, len) => {
-                    if touches(written, src, src + len) {
+                    if touches(written, src, src + len) && card_fill(&spans, dst, src, len).is_none() {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
@@ -3210,6 +3259,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                fills: OnceLock::new(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -4345,6 +4395,9 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        if late && card_fills() {
+            batch.written = line().written.clone();
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4354,6 +4407,19 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        if !batch.card_fills.is_empty() {
+            let fills = std::mem::take(&mut batch.card_fills);
+            let Some(list) = self.record_card_fills(runs[0], &fills) else {
+                fail(format_args!("no host list for fills of upload memory made by the card"));
+            };
+            for (_, _, shadow, _, _) in &fills {
+                runs[0].keep(&shadow.buffer);
+            }
+            lists.insert(0, Some(list));
+            for first in &mut firsts {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -5582,6 +5648,11 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let spans = if batch.written.is_empty() {
+            Vec::new()
+        } else {
+            self.scratch.lock().unwrap_or_else(|e| e.into_inner()).spans()
+        };
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
@@ -5598,6 +5669,16 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
+                    // Flights may write the source: the card copies it from
+                    // the source's host copy behind them, ahead of the
+                    // lists, as up to date as a refresh makes it now.
+                    if touches(&batch.written, src, src + len)
+                        && let Some((chunk, at, shadow)) = card_fill(&spans, dst, src, len)
+                    {
+                        batch.add(&shadow, src, len);
+                        batch.card_fills.push((chunk, at, shadow, src, len));
+                        continue;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -5697,6 +5778,13 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The title memory shaders of flights in the air may write, when the
+    /// submission began preparing ([`card_fills`]).
+    written: Vec<(usize, usize)>,
+    /// Fills of upload memory the card makes ahead of the submission's
+    /// lists: the chunk's buffer, the offset in it, the source's host copy,
+    /// the source and the bytes.
+    card_fills: Vec<(ID3D12Resource, u64, std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -6038,6 +6126,103 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
+                None
+            }
+        }
+    }
+
+    /// Records the fills of upload memory the card makes for a submission
+    /// ([`card_fills`]) into `first`'s list for them: the copies, then the
+    /// buffers back to the common state, for the lists that follow in the
+    /// same submission (the chunks are read there, the copies may be
+    /// written). The list is reset like the state prelude, when `first` is
+    /// submitted again.
+    fn record_card_fills(
+        &self,
+        first: &HostList,
+        fills: &[(ID3D12Resource, u64, std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) -> Option<ID3D12CommandList> {
+        use windows::core::Interface;
+        let (allocator, list) = first.fills.get_or_init(|| self.make_prelude()).as_ref()?;
+        let mut chunks: Vec<&ID3D12Resource> = Vec::new();
+        let mut sources: Vec<&ID3D12Resource> = Vec::new();
+        for (chunk, _, shadow, _, _) in fills {
+            if !chunks.iter().any(|c| c.as_raw() == chunk.as_raw()) {
+                chunks.push(chunk);
+            }
+            if !sources.iter().any(|c| c.as_raw() == shadow.buffer.as_raw()) {
+                sources.push(&shadow.buffer);
+            }
+        }
+        let mut back: Vec<D3D12_RESOURCE_BARRIER> = chunks
+            .iter()
+            .map(|c| transition(c, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        back.extend(sources.iter().map(|s| transition(s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)));
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let made = MADE.fetch_add(fills.len() as u64, Ordering::Relaxed) + fills.len() as u64;
+        let before = made - fills.len() as u64;
+        if before == 0 || before.ilog2() != made.ilog2() {
+            tracing::info!(made, now = fills.len(), "fills of upload memory made by the card, behind the flights");
+        }
+        // SAFETY: the list is not executing (its submission was run); the
+        // buffers are live, the ranges inside them.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                for (chunk, at, shadow, src, len) in fills {
+                    list.CopyBufferRegion(chunk, *at, &shadow.buffer, shadow.offset(*src as u64), *len as u64);
+                }
+                list.ResourceBarrier(&back);
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("the card's fills of upload memory did not record ({e})"));
+        }
+        list.cast().ok()
+    }
+
+    /// As [`Host::upload_buffer`], in a heap the card can also copy into
+    /// (write-combined system memory, as upload memory is, starting in the
+    /// common state): for scratch chunks with [`card_fills`].
+    pub(crate) fn scratch_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[0].fetch_add(1, Ordering::Relaxed);
+        MADE[1].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no scratch buffer the card can copy into");
                 None
             }
         }

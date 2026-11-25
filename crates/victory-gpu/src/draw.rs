@@ -2613,14 +2613,14 @@ impl State {
     /// 256-byte aligned there, its whole view inside the copy): its table
     /// is then made from the title's slots like any other
     /// ([`State::table_entry`]), not afresh for every draw
-    /// (`VICTORY_CB_TABLES_MIRROR`, on by default with
-    /// `VICTORY_TABLE_CB_COPY`; `0`: every table holding one is made afresh,
-    /// as before). Run s21: making tables afresh was some 10 s of the
-    /// recording threads' time in 20 s of play.
+    /// (`VICTORY_CB_TABLES_MIRROR=1`, off by default: run s22 had dispatches
+    /// at ~300 us each with it against ~90, every draw looking each constant
+    /// buffer's copy up and refreshing it where a fresh table did so once per
+    /// list).
     fn constant_in_copy(&self, u: &UsedResource, compute: bool) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| {
-            table_constants_in_copy() && std::env::var_os("VICTORY_CB_TABLES_MIRROR").is_none_or(|v| v != "0")
+            table_constants_in_copy() && std::env::var_os("VICTORY_CB_TABLES_MIRROR").is_some_and(|v| v == "1")
         }) {
             return false;
         }

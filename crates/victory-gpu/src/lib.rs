@@ -57,6 +57,8 @@ mod texture;
 mod watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod readwatch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profiler;
 #[cfg(windows)]
 mod texback;
 

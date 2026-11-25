@@ -937,7 +937,9 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        // (Not capped at `DYNAMIC` places: that cut off the `n - 1` past the
+        // cursor whenever the search went round. The ranges bound it.)
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -3282,23 +3284,24 @@ mod tests {
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 41));
     }
 
-    /// Contiguous free dynamic slot ranges that cross the search cursor are found.
+    /// A free run of dynamic slots that crosses the search cursor is found:
+    /// after the end, the search starts again from the start and goes on
+    /// `n - 1` slots past the cursor.
     #[test]
     fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Allocate slots 0..8, advancing cursor to 8.
-        let a = heap.dynamic(8).unwrap();
-        // Allocate slots 8..16, advancing cursor to 16.
-        let b = heap.dynamic(8).unwrap();
-        assert_eq!((a, b), (4, 12));
-
-        // Release slots 10..14 (crossing cursor at 12).
-        // Before the fix, a request of 4 slots starting search at 12 scanned 12..end then 0..12,
-        // missing the contiguous run at 10..14.
-        heap.release(14, 4);
-        let c = heap.dynamic(4);
-        assert_eq!(c, Some(14));
+        // Every slot taken (the last slot is never given).
+        assert_eq!(heap.dynamic(heap.dynamic - 1), Some(4));
+        // Dynamic slots 10..30 free, then 10..20 taken again: the cursor
+        // stops at 20, inside the free run, and 10..20 is given back.
+        heap.release(4 + 10, 20);
+        assert_eq!(heap.dynamic(10), Some(4 + 10));
+        heap.release(4 + 10, 10);
+        // From the cursor on only 20..30 is free (10 slots): a run of 15 has
+        // to start before the cursor and cross it. Searching the start only
+        // up to the cursor found 10 slots and gave none.
+        assert_eq!(heap.dynamic(15), Some(4 + 10));
     }
 }

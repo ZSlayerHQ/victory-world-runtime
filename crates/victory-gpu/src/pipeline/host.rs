@@ -1079,9 +1079,18 @@ mod tests {
         }
         // The software adapter says it takes the test and draws through it
         // all the same (depth 0.5 passes bounds of [0.6, 1.0]): the test is
-        // for a card.
+        // for a card. A run that asked for the software adapter skips it, as
+        // before. A runner whose only device is software skips it when the
+        // CI-only variable asks; a desk that did not ask for the software
+        // adapter and has no card still fails here, as it should.
         if crate::host::on_warp() {
             eprintln!("the software adapter does not apply depth bounds; skipped");
+            return;
+        }
+        if host.is_software()
+            && std::env::var("VICTORY_TESTS_ALLOW_SOFTWARE_SKIP").is_ok_and(|v| v == "1")
+        {
+            eprintln!("the software adapter does not apply depth bounds; skipped (VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1)");
             return;
         }
         let Some(dxc) = dxc() else {

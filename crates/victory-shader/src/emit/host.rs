@@ -62,6 +62,23 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether `device` is on the software adapter: the basic render driver's flag, or its vendor and device.
+fn software(device: &ID3D12Device) -> bool {
+    // SAFETY: a plain factory and adapter query for a live device.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()) else {
+            return false;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return false;
+        };
+        desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -91,15 +108,10 @@ impl Host {
                 // whose first adapter is a display stub that cannot make a
                 // device): that is no hardware device, and the tests that
                 // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device {
-                    let factory: IDXGIFactory4 =
-                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                        && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
-                    {
-                        return Err("the default device is the software adapter".to_owned());
-                    }
+                if let Some(made) = &device
+                    && software(made)
+                {
+                    return Err("the default device is the software adapter".to_owned());
                 }
             }
             let device = device.ok_or("no device")?;
@@ -121,6 +133,11 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// Whether the device is on the software adapter: asked of the device itself, the one a test runs on.
+    pub fn is_software(&self) -> bool {
+        software(&self.device)
     }
 
     /// The root signature translated shaders expect: user data per stage

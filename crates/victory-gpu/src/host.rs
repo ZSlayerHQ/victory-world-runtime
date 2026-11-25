@@ -678,6 +678,23 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+impl Host {
+    /// Whether this device is on the software adapter (WARP or the basic render driver): asked of the adapter the
+    /// device reports, not of a switch. Used by the tests that need a card.
+    #[cfg(test)]
+    pub(crate) fn is_software(&self) -> bool {
+        self.adapter
+            .as_ref()
+            .and_then(|adapter| adapter.cast::<IDXGIAdapter1>().ok())
+            // SAFETY: a plain adapter query.
+            .and_then(|adapter| unsafe { adapter.GetDesc1().ok() })
+            .is_some_and(|desc| {
+                desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+            })
+    }
+}
+
 /// Whether the host device is the software adapter (WARP): diagnostics
 /// builds with `VICTORY_D3D12_WARP`.
 pub(crate) fn on_warp() -> bool {

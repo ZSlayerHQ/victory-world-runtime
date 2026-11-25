@@ -253,6 +253,12 @@ fn run_cases(
     run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
 }
 
+/// CI has no graphics card: a test that reaches the software adapter reports itself ignored, with a reason, when
+/// `VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1` (CI sets it). Without the variable, or on a real card, nothing changes.
+fn skip_software(host: &Host) -> bool {
+    host.is_software() && std::env::var("VICTORY_TESTS_ALLOW_SOFTWARE_SKIP").is_ok_and(|v| v == "1")
+}
+
 fn run_cases_on(
     shader: &HostShader,
     cases: &[[u32; 4]],
@@ -261,11 +267,19 @@ fn run_cases_on(
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
+    let mut skipped_absent = 0;
+    let mut skipped_software = 0;
     for &(label, warp) in devices {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
+            skipped_absent += 1;
             continue;
         };
+        if skip_software(&host) {
+            eprintln!("{label}: the software adapter is skipped (VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1)");
+            skipped_software += 1;
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -294,6 +308,11 @@ fn run_cases_on(
             check(label, i, inputs, out[0][0]);
         }
         ran += 1;
+    }
+    if ran == 0 && skipped_software > 0 && skipped_absent + skipped_software == devices.len() {
+        // CI has no graphics card: every device was absent, or the software one was skipped by the variable.
+        eprintln!("no SM 6.6 device to run on; the software adapter is skipped (VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1)");
+        return;
     }
     if ran == 0 && devices.iter().all(|&(_, warp)| !warp) {
         // A case for the hardware adapter alone, on a machine without one.
@@ -1624,6 +1643,10 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         let Ok(host) = Host::new(warp) else {
             continue;
         };
+        if skip_software(&host) {
+            eprintln!("{label}: the software adapter is skipped (VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1)");
+            continue;
+        }
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(p) => p,
             // WARP does not support fixed WaveSize(32) on SM 6.6.

@@ -1,21 +1,35 @@
-# victory-world-runtime
+# ZSlayer PC Port: Runtime
 
-The runtime of [victory-world](https://github.com/ZSlayerHQ/victory-world), a
-community project that runs an Xbox Series title on Windows from a copy the
-user owns. It is a fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs the title's own x86-64 code natively and supplies
-the console platform under it, and it carries fixes from the public forks
-credited below as well as the project's own. GPL-3.0-or-later, like VIctory.
+Formerly `victory-world-runtime`; old links redirect.
 
-**No game files, code or assets are here, and none are shared.** You need your
-own copy of the title on your own disk; shaders are translated on your machine
-from that copy. This project is not affiliated with or endorsed by the title's
-developer or publisher.
+This is the program that runs a console game (called "the title" below) on a
+Windows PC. It runs the game's own x86-64 code directly on your processor,
+stands in for the console's system software underneath it, and translates the
+game's graphics programs (shaders) so that a PC graphics card can draw them. It
+is a fork of
+[VIctory](https://github.com/Marvisak/VIctory) by Marvisak, carrying fixes from
+the public forks credited below as well as this project's own.
+GPL-3.0-or-later, like VIctory.
+
+**It holds no game files.** No game code, assets or shaders are here, and none
+are shared. You need your own copy of the title, from your own console, on your
+own disk; its shaders are translated on your machine from that copy. This
+project is not affiliated with or endorsed by the title's developer or
+publisher.
+
+**Where it stands: not playable yet.** The title starts, its menus run at their
+normal speed and it reaches the game world, but there it runs at about 3 frames
+a second and parts of the picture are still wrong or missing.
+
+**The test-run tools are in a second repository.**
+[zslayer-pc-port-tools](https://github.com/ZSlayerHQ/zslayer-pc-port-tools)
+holds the scripts that start, record and measure a test run, the list of what
+is known to be broken, and how to help.
 
 ## Branches
 
-- **`next`**: the line to use and to open pull requests against. It carries the
-  public forks merged together plus the project's fixes, and is not yet
+- **`next`**: the line to use and to send pull requests to. It merges the
+  public forks together with this project's fixes, and has not yet been
   reviewed as a whole.
 - **`world`**: reviewed work only. Changes move here from `next` once reviewed.
 
@@ -25,21 +39,22 @@ You need Windows 10 or 11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, a current GPU driver, Git, Visual Studio Build
 Tools (the MSVC C++ workload and a Windows 10/11 SDK) and
 [rustup](https://rustup.rs). The Rust toolchain pinned in `rust-toolchain.toml`
-installs itself on the first build. In the world the title uses about 24 GB of
-RAM and 9 GB of video memory, and the cache and builds need about 40 GB of disk
-besides your copy of the title.
+installs itself on the first build. In the game world the title uses about
+24 GB of RAM and 9 GB of video memory, and the cache and builds need about
+40 GB of disk besides your copy of the title.
 
-The title also needs several GiB of available Windows commit at startup.
+The title also needs several GiB of unclaimed Windows commit memory (RAM plus
+paging file that no program has claimed yet) when it starts.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
-1. **Get the code** and install the asset-policy check that runs on every
-   commit:
+1. **Get the code**, and install the check that stops game files being
+   committed (it runs on every commit):
 
    ```powershell
-   git clone -b next https://github.com/ZSlayerHQ/victory-world-runtime
-   cd victory-world-runtime
+   git clone -b next https://github.com/ZSlayerHQ/zslayer-pc-port-runtime
+   cd zslayer-pc-port-runtime
    cargo xtask install-hooks
    ```
 
@@ -73,7 +88,7 @@ the Windows paging file size, then retry.
    ```
 
    The diagnostics build carries the debugging switches (see Debugging below)
-   and is the one to run while the world is being fixed.
+   and is the one to run while the game world is being fixed.
    `cargo build --release -p victory --locked` gives `target\release\victory.exe`
    without them.
 
@@ -93,9 +108,10 @@ the Windows paging file size, then retry.
    are kept under the data folder, and derived data under the cache folder.
 
 For repeatable runs, use the run harness in
-[victory-world](https://github.com/ZSlayerHQ/victory-world) (`harness/`). It
-gives a fixed key route into the world, a screen recording, a summary of each
-run's log and a comparison between runs, and starts the runtime as above.
+[zslayer-pc-port-tools](https://github.com/ZSlayerHQ/zslayer-pc-port-tools)
+(`harness/`). It can press a timed sequence of keys you supply (`--keys`, or a
+route file in `harness/routes/`; none ships), records the screen, summarises
+each run's log and compares runs, and starts the runtime as above.
 
 ## Working on a fork? Send it back
 
@@ -139,11 +155,17 @@ and let them decide whether to send it.
 - **[XCL](https://github.com/xcl-dev/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
+- **[victory-amd](https://github.com/myokex/victory-amd)** by myokex, the fork
+  line this repository grew out of (the setup clone in earlier revisions
+  pointed at [JoshuaO22's copy](https://github.com/JoshuaO22/victory-amd)).
+- The guard over all the views of a page is code of
+  [victory-fork #115](https://github.com/fxceless/victory-fork/pull/115) by
+  Spexivus, with [its correction](https://github.com/Spexivus/victory-fork/pull/1)
+  by joroyt and a part of [VIctory #1122](https://github.com/Marvisak/VIctory/pull/1122)
+  by tightfall, adapted here. The second look at textures is fxceless's idea
+  (victory-fork `a803c87`), written anew.
 - The fixes on this line were developed with
   [Claude Code](https://claude.com/claude-code).
-
-- **[victory-amd](https://github.com/myokex/victory-amd)** by myokex, the fork line this repository grew out of (the setup clone in earlier revisions pointed at [JoshuaO22's copy](https://github.com/JoshuaO22/victory-amd)).
-- The guard over all the views of a page is code of [victory-fork #115](https://github.com/fxceless/victory-fork/pull/115) by Spexivus, with [its correction](https://github.com/Spexivus/victory-fork/pull/1) by joroyt and a part of [VIctory #1122](https://github.com/Marvisak/VIctory/pull/1122) by tightfall, adapted here. The second look at textures is fxceless's idea (victory-fork `a803c87`), written anew.
 
 ## The base fork's notes (fxceless/victory-fork)
 

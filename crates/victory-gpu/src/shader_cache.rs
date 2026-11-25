@@ -62,7 +62,8 @@ fn build() -> &'static [u8; 32] {
             hash.update(source.as_bytes());
         }
         hash.update(env!("CARGO_PKG_VERSION").as_bytes());
-        hash.update(&[u8::from(cfg!(feature = "diagnostics"))]);
+        // (not whether this is a diagnostics build: both translate alike, and
+        // a release build then finds what diagnostics runs translated)
         for n in [
             limit,
             victory_shader::emit::view_heap_limit(),

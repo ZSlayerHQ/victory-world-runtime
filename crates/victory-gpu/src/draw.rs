@@ -1144,7 +1144,12 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                #[cfg(feature = "diagnostics")]
+                let readying = std::time::Instant::now();
+                let ready = self.memory_ready(list, compute, writes);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::phase_add(7, readying);
+                let Some(ready) = ready else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2603,6 +2608,36 @@ impl State {
         }
     }
 
+    /// Whether a constant buffer a shader reads through a table can be
+    /// viewed in its buffer's host copy from the title's own slot (it lies
+    /// 256-byte aligned there, its whole view inside the copy): its table
+    /// is then made from the title's slots like any other
+    /// ([`State::table_entry`]), not afresh for every draw
+    /// (`VICTORY_CB_TABLES_MIRROR`, on by default with
+    /// `VICTORY_TABLE_CB_COPY`; `0`: every table holding one is made afresh,
+    /// as before). Run s21: making tables afresh was some 10 s of the
+    /// recording threads' time in 20 s of play.
+    fn constant_in_copy(&self, u: &UsedResource, compute: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| {
+            table_constants_in_copy() && std::env::var_os("VICTORY_CB_TABLES_MIRROR").is_none_or(|v| v != "0")
+        }) {
+            return false;
+        }
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return false;
+        };
+        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else {
+            return false;
+        };
+        let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            return false;
+        };
+        let whole = u64::from(size.min(64 << 10).next_multiple_of(256));
+        shadow.gpu(address) % 256 == 0 && shadow.left(address) >= whole && !shadow.in_place()
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -2646,6 +2681,7 @@ impl State {
             .iter()
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| !self.constant_in_copy(u, compute))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -3458,6 +3494,16 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    // A constant buffer viewed in its buffer's host copy (a table made from
+    // the title's slots, `State::constant_in_copy`): the range brought up to
+    // date at submission.
+    if let &View::Constant(address, size) = view {
+        if let Some(shadow) = crate::shadow::find(address, u64::from(size)) {
+            let whole = u64::from(size.min(64 << 10).next_multiple_of(256)).min(shadow.left(address));
+            shadow.refresh(list, address, whole);
+        }
+        return;
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;

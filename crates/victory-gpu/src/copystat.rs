@@ -986,8 +986,13 @@ thread_local! {
 /// buffers and target states, 2 textures picked by index, 3 heaps, root
 /// signature and pipeline (and the root views of earlier stages), 4
 /// descriptor tables, 5 user data and root constant and shader views, 6
-/// root unordered access views.
-static PHASES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// root unordered access views; 7 of 5, title memory by address made ready.
+static PHASES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Adds the time since `since` to phase `n`.
+pub(crate) fn phase_add(n: usize, since: std::time::Instant) {
+    PHASES[n].fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+}
 
 /// Adds the time since `*at` to phase `n` and restarts `*at`.
 pub(crate) fn phase(n: usize, at: &mut std::time::Instant) {
@@ -1035,7 +1040,7 @@ pub(crate) fn recorded_at(started: std::time::Instant, site: &'static std::panic
     tracing::info!("list-call time by call, since the last table: {}", table.join("; "));
     let phases: Vec<String> = PHASES.iter().map(|p| format!("{:.0}", p.swap(0, Relaxed) as f64 / 1e6)).collect();
     tracing::info!(
-        "draw preparing since the last table, ms (pipeline lookup, vertex/index/targets, indexed textures, heaps/root/pso, tables, user data + root CBV/SRV, root UAVs): {}",
+        "draw preparing since the last table, ms (pipeline lookup, vertex/index/targets, indexed textures, heaps/root/pso, tables, user data + root CBV/SRV, root UAVs; of user data, memory by address): {}",
         phases.join(", ")
     );
     all.clear();

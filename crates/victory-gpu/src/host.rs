@@ -5266,6 +5266,26 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        // Diagnostics: a copy (done at submission, before the list runs)
+        // whose source this list's shaders write first copies what was
+        // there before them. Counted and logged at powers of two.
+        #[cfg(feature = "diagnostics")]
+        {
+            let (s, e) = (src as usize, src as usize + len);
+            if deferred.copies.iter().any(|step| matches!(step, Step::GpuWrite(_, a, l) if *a < e && s < *a + *l)) {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        n,
+                        src = format_args!("{src:p}"),
+                        dst = format_args!("{dst:p}"),
+                        len,
+                        "a buffer copy reads a range the same list's shaders write before it: it copies the bytes from before them (copies run at submission)"
+                    );
+                }
+            }
+        }
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one

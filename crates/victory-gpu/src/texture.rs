@@ -70,11 +70,33 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame its hash last found it changed ([`hot`]).
+    changed: Option<u64>,
     /// The texture was found changed without a write the guard saw
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
 }
+
+/// Whether a texture in view memory whose hash found it changed lately
+/// (within [`HOT_FRAMES`]) is hashed at every check, not every eighth frame
+/// (`VICTORY_TEXTURE_HOT=1`; off by default until measured).
+///
+/// What the guards cannot see, a write to the same pages through another
+/// mapping, only the hash finds, and it was taken every eighth frame by
+/// address. A texture the title rewrites every frame that way showed one
+/// frame in eight: the boot's loading video plays from three such textures
+/// in turn, and each took a new frame only at its hash turn, so the screen
+/// cycled through three stale pictures (sp-probe4: a period of three at
+/// 30 fps, a slot changing every eight frames, 1.7 MB of texture uploads a
+/// frame). In gameplay at 2-3 frames a second, eight frames are seconds.
+fn hot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_some_and(|v| v == "1"))
+}
+
+/// Frames a texture stays [`hot`] after its hash last found a change.
+const HOT_FRAMES: u64 = 30;
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -749,11 +771,12 @@ impl Staging {
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let changing = hot() && last.changed.is_some_and(|at| frame < at + HOT_FRAMES);
             // Linear pictures of one level are what the processor draws (the
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
             let film = desc.swizzle.0 == 0 && desc.mips == 1;
-            if unwritten && !turn && !film && frame >= last.unguarded {
+            if unwritten && !turn && !changing && !film && frame >= last.unguarded {
                 return 0;
             }
             unseen = unwritten;
@@ -797,6 +820,7 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
+                last.changed = Some(crate::frame::current());
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -822,6 +846,7 @@ impl Staging {
                     self.unseen_write(last);
                 }
                 last.hash = Some(hash);
+                last.changed = Some(crate::frame::current());
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -841,6 +866,7 @@ impl Staging {
             self.unseen_write(last);
         }
         last.hash = Some(hash);
+        last.changed = Some(crate::frame::current());
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

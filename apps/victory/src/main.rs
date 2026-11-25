@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 mod run;
@@ -140,6 +141,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    // Keep the Agility exports in the binary: D3D12 reads them off the
+    // executable, and on Windows 10 they are what gets it past shader model 6.5.
+    let _ = agility::runtime_dir();
     match cli.command {
         Command::Inspect {
             file,

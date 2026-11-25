@@ -2144,6 +2144,49 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Diagnostics: the title buffer copies and fills of upload memory that
+/// made a submission wait for flights, counted by kind, size and the range
+/// declared written that they touch (`BLOCKED`), with the time waited for
+/// them (`blocked_waited`); a table of the biggest every 20 s.
+#[cfg(feature = "diagnostics")]
+static BLOCKED: Mutex<(Option<std::collections::HashMap<String, (u64, u64)>>, Option<String>, u64)> = Mutex::new((None, None, 0));
+
+#[cfg(feature = "diagnostics")]
+fn note_blocked(what: &str, src: usize, dst: usize, len: usize, written: &[(usize, usize)]) {
+    let first = |from: usize, to: usize| written.iter().find(|r| r.0 < to && from < r.1).copied();
+    let (side, range) = match (first(src, src + len), first(dst, dst + len)) {
+        (Some(r), _) => ("source", r),
+        (None, Some(r)) => ("destination", r),
+        (None, None) => ("neither", (0, 0)),
+    };
+    let size = if len <= 64 { len.to_string() } else { format!("~{}", len.next_power_of_two()) };
+    let key = format!("{what} of {size} bytes, {side} in {:#x}..{:#x} ({} KB)", range.0, range.1, (range.1 - range.0) >> 10);
+    let mut b = BLOCKED.lock().unwrap_or_else(|e| e.into_inner());
+    b.0.get_or_insert_with(Default::default).entry(key.clone()).or_default().0 += 1;
+    b.1 = Some(key);
+}
+
+/// Diagnostics: a submission waited `us` for the flights the last
+/// [`note_blocked`] named.
+#[cfg(feature = "diagnostics")]
+fn blocked_waited(us: u64) {
+    let mut b = BLOCKED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(key) = b.1.take() else { return };
+    if let Some(e) = b.0.get_or_insert_with(Default::default).get_mut(&key) {
+        e.1 += us;
+    }
+    let now = now_ms();
+    if now < b.2 + 20_000 {
+        return;
+    }
+    b.2 = now;
+    let mut rows: Vec<(String, (u64, u64))> = b.0.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
+    rows.sort_by(|x, y| y.1.1.cmp(&x.1.1));
+    for (key, (n, us)) in rows.iter().take(8) {
+        tracing::info!("flights waited for, since the start: {key}: {n} times, {} ms", us / 1000);
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2158,14 +2201,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_blocked("buffer copy", src, dst, len, written);
                         }
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
+                &Step::Fill(dst, src, len) => {
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_blocked("upload fill", src, dst, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -4200,12 +4247,18 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
+            #[cfg(feature = "diagnostics")]
+            let blocked_at = std::time::Instant::now();
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
+            }
+            #[cfg(feature = "diagnostics")]
+            if why == WHY_READ {
+                blocked_waited(blocked_at.elapsed().as_micros() as u64);
             }
         }
         let behind = late && flying();

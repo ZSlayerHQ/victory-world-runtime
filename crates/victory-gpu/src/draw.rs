@@ -921,6 +921,12 @@ impl State {
                 _ => {}
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if writes {
+            crate::shadow::note_big_write("raw-address shader (every numbered copy)", 0, u64::MAX, || {
+                crate::pipeline::shaders_of(self.pipeline as This)
+            });
+        }
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
@@ -1296,10 +1302,16 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
+                #[cfg(feature = "diagnostics")]
+                crate::shadow::note_big_write("root UAV (to the buffer's end)", a, len, || {
+                    crate::pipeline::shaders_of(pipeline as This)
+                });
                 s.gpu_writes(list, a, len);
             }
         };
@@ -3410,6 +3422,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
+                #[cfg(feature = "diagnostics")]
+                crate::shadow::note_big_write("table UAV view (title-sized)", address, len, String::new);
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

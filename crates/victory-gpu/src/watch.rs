@@ -428,6 +428,11 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// For blocks found written at their last checks: how many checks in a
+    /// row ([`hot_after`]). A block written between every two checks is left
+    /// writable: guarding it again only buys a fault and two protection
+    /// changes per check, and it is copied at every check either way.
+    streak: std::collections::BTreeMap<usize, u16>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -435,7 +440,31 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    streak: std::collections::BTreeMap::new(),
 });
+
+/// Checks in a row a block must be found written to be left writable (hot),
+/// `VICTORY_GUARD_HOT` (default 0, off: every written block is guarded again;
+/// run g16 with 4 copied hot blocks at every check, moves 61 -> 110 ms). A hot block is guarded again after [`HOT_RETRY`] more
+/// checks, to see whether it has cooled. In gameplay the title writes some
+/// blocks of view memory between nearly every two of the 20 checks a frame
+/// its big pools get: each check guarded them again and the next write
+/// faulted, about ten thousand faults a frame with the guard over every view
+/// of a page (`VICTORY_VIEW_GUARD`), whose protection changes cover every
+/// view.
+fn hot_after() -> u16 {
+    static N: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Checks a hot block stays writable before it is guarded again.
+const HOT_RETRY: u16 = 256;
+
+/// Diagnostics: blocks a check left writable because they were hot.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HOT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -476,6 +505,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    // Blocks with a streak that this check finds clean: their streak ends.
+    // Only the few written blocks have one, so this is no per-block lookup.
+    let cooled: Vec<usize> = g
+        .streak
+        .range(first..last)
+        .map(|(&b, _)| b)
+        .filter(|b| clean.binary_search(b).is_ok())
+        .collect();
+    for b in cooled {
+        g.streak.remove(&b);
+    }
+    let hot_after = hot_after();
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
@@ -501,6 +542,46 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else {
+                if hot_after > 0 {
+                    let s = {
+                        let e = g.streak.entry(block).or_insert(0);
+                        *e = e.saturating_add(1);
+                        *e
+                    };
+                    let retry = hot_after.saturating_add(HOT_RETRY);
+                    if s >= retry {
+                        // Guard it once more, to see whether it has cooled.
+                        g.streak.insert(block, 0);
+                    } else if s >= hot_after {
+                        // Hot: leave it writable, reported written at every check.
+                        if let Some(from) = run.take() {
+                            protect(&mut g, from, block);
+                        }
+                        // A write through this view no longer faults to open
+                        // the page's other views: they are opened now (not
+                        // clean, so reported written at their own checks) and
+                        // made hot too, so their checks leave them writable
+                        // rather than guard this one again with them. Whatever
+                        // guards one of them later guards this one with it.
+                        if view_guard() {
+                            let shown = crate::inplace::pages_of(block * BLOCK);
+                            if (2..=MANY_VIEWS).contains(&shown.len()) {
+                                for alias in shown {
+                                    let a = alias / BLOCK;
+                                    if a == block {
+                                        continue;
+                                    }
+                                    open_here(&mut g, alias, alias.saturating_add(BLOCK));
+                                    let e = g.streak.entry(a).or_insert(0);
+                                    *e = (*e).max(hot_after - 1);
+                                }
+                            }
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        HOT_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 run.get_or_insert(block);
                 continue;
             }
@@ -824,6 +905,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    let streaks: Vec<usize> = g.streak.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+    for block in streaks {
+        g.streak.remove(&block);
     }
 }
 

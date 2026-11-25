@@ -1141,9 +1141,11 @@ pub(crate) fn log(frames: f64) {
     );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
+    let hot = crate::watch::HOT_LEFT.load(std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped; \
+         {hot} hot blocks left writable at checks (VICTORY_GUARD_HOT)"
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and

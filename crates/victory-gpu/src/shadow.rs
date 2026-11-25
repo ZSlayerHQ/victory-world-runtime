@@ -1759,6 +1759,12 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        #[cfg(feature = "diagnostics")]
+        if self.place.is_none() && len.min(self.left(address)) >= BIG_WRITE {
+            note_big_write("declared on a host copy", address, len.min(self.left(address)), || {
+                format!("copy {:#x}+{:#x}", self.start, self.len)
+            });
+        }
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -3298,4 +3304,35 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Diagnostics: declared shader writes at least this big are logged
+/// ([`note_big_write`]).
+#[cfg(feature = "diagnostics")]
+const BIG_WRITE: u64 = 16 << 20;
+
+/// Diagnostics: logs (40 distinct at most, by place and address) a range
+/// of title memory declared written by shaders of [`BIG_WRITE`] or more:
+/// with flights in the air, every title buffer copy or fill of upload
+/// memory that reads anywhere in it waits for them (run g16: the title's
+/// 174 MB heap, two waits of ~100 ms a frame). `u64::MAX` as the length:
+/// a shader that writes by raw address, every numbered copy at once.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_big_write(how: &'static str, address: u64, len: u64, who: impl FnOnce() -> String) {
+    if len < BIG_WRITE {
+        return;
+    }
+    static SEEN: Mutex<Vec<(&'static str, u64, u64)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 40 || seen.contains(&(how, address, len)) {
+        return;
+    }
+    seen.push((how, address, len));
+    drop(seen);
+    let who = who();
+    if len == u64::MAX {
+        tracing::info!("big shader write declared: {how}; {who}");
+    } else {
+        tracing::info!("big shader write declared: {how}, {:#x}..{:#x} ({} KB); {who}", address, address + len, len >> 10);
+    }
 }

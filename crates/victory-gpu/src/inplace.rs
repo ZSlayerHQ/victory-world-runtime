@@ -1110,7 +1110,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over

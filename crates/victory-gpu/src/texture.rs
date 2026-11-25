@@ -107,39 +107,135 @@ struct Idle(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is only written by the staging that takes it.
 unsafe impl Send for Idle {}
 
-/// Idle staging buffers by size class, and their bytes.
-static POOL: Mutex<(std::collections::BTreeMap<u64, Vec<Idle>>, u64)> =
-    Mutex::new((std::collections::BTreeMap::new(), 0));
+/// Idle staging buffers by size class, their bytes, and the most bytes
+/// it keeps idle (0: none, every staging makes and releases its own).
+struct Pool {
+    classes: std::collections::BTreeMap<u64, Vec<Idle>>,
+    idle: u64,
+    most: u64,
+}
+
+impl Pool {
+    const fn new(most: u64) -> Self {
+        Pool {
+            classes: std::collections::BTreeMap::new(),
+            idle: 0,
+            most,
+        }
+    }
+
+    /// A staging buffer of at least `size` bytes: one of its class from
+    /// the pool, or one `make` makes (of the class's size; of `size`
+    /// itself with the pool off). With it its mapping, its class (0: not
+    /// pooled, released with its staging), and whether it held another
+    /// texture's bytes. The lock is not held while `make` runs.
+    fn take(
+        this: &Mutex<Pool>,
+        size: u64,
+        make: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>,
+    ) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
+        let class = {
+            let mut pool = this.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.most == 0 {
+                drop(pool);
+                let (buffer, data) = make(size)?;
+                return Some((buffer, data, 0, false));
+            }
+            let class = pool_class(size);
+            if let Some(Idle(buffer, data)) = pool.classes.get_mut(&class).and_then(Vec::pop) {
+                pool.idle -= class;
+                return Some((buffer, data, class, true));
+            }
+            class
+        };
+        let (buffer, data) = make(class)?;
+        Some((buffer, data, class, false))
+    }
+
+    /// Keeps a staging's buffer of `class` for a later one, if the pool
+    /// has room for its bytes; whether it did. A buffer not kept is
+    /// released by the caller.
+    fn give(&mut self, class: u64, buffer: ID3D12Resource, data: *mut u8) -> bool {
+        if class == 0 || self.most == 0 || self.idle + class > self.most {
+            return false;
+        }
+        self.idle += class;
+        self.classes.entry(class).or_default().push(Idle(buffer, data));
+        true
+    }
+
+    /// Lets go of every idle buffer (the device that made them is gone).
+    fn clear(&mut self) {
+        self.classes.clear();
+        self.idle = 0;
+    }
+}
+
+/// The pool of the host's staging buffers ([`pool_most`]).
+static POOL: Mutex<Pool> = Mutex::new(Pool::new(u64::MAX));
 
 /// Since the start: staging buffers taken from the pool, made new for it,
 /// and the microseconds the made ones took.
 pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// A staging buffer of at least `size` bytes, its mapping, its class (0:
-/// not pooled), and whether it held another texture's bytes.
+/// [`Pool::take`] from the host's pool, with the host's upload buffers.
+///
+/// With the device removed, the idle buffers are let go and none is taken
+/// again: they belong to the removed device (VIctory does not make another
+/// one, and nothing would read them; this only gives their memory back).
 fn pooled_upload(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
     let host = host()?;
-    if pool_most() == 0 {
-        let (buffer, data) = host.upload_buffer(size)?;
-        return Some((buffer, data, 0, false));
-    }
-    let class = pool_class(size);
     {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        let (classes, idle) = &mut *pool;
-        if let Some(Idle(buffer, data)) = classes.get_mut(&class).and_then(Vec::pop) {
-            *idle -= class;
-            POOL_STATS[0].fetch_add(1, Relaxed);
-            return Some((buffer, data, class, true));
+        pool.most = pool_most();
+        // A cheap query, and a lost device takes a pooled buffer out of use.
+        if pool.most != 0 && crate::descriptor::host::device_removed().is_some() {
+            pool.clear();
+            pool.most = 0;
         }
     }
-    let began = std::time::Instant::now();
-    let (buffer, data) = host.upload_buffer(class)?;
-    POOL_STATS[1].fetch_add(1, Relaxed);
-    POOL_STATS[2].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
-    Some((buffer, data, class, false))
+    let mut made = None;
+    let taken = Pool::take(&POOL, size, |bytes| {
+        let began = std::time::Instant::now();
+        let buffer = host.upload_buffer(bytes);
+        made = Some(began.elapsed());
+        buffer
+    })?;
+    match made {
+        Some(took) => {
+            POOL_STATS[1].fetch_add(1, Relaxed);
+            POOL_STATS[2].fetch_add(took.as_micros() as u64, Relaxed);
+        }
+        None => {
+            POOL_STATS[0].fetch_add(1, Relaxed);
+        }
+    }
+    Some(taken)
+}
+
+/// Whether the first refresh of a staging zeroes its buffer: it came
+/// from the pool (another texture's bytes) and nothing was detiled into
+/// it whole. Called under `Staging::last`'s lock, which detiling takes;
+/// true once at most.
+fn zero_first(recycled: &std::sync::atomic::AtomicBool, detiled: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    !detiled.load(Relaxed) && recycled.swap(false, Relaxed)
+}
+
+/// Zeroes the parts of a staging buffer mapped at `data` that its
+/// footprints and row counts lay out.
+///
+/// # Safety
+/// `data` maps a buffer that holds every part, and nothing else writes it.
+unsafe fn zero_parts(data: *mut u8, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32]) {
+    for (footprint, &rows) in footprints.iter().zip(rows) {
+        let f = footprint.Footprint;
+        let len = f.RowPitch as usize * rows as usize * f.Depth as usize;
+        // SAFETY: the part lies in the buffer (the caller's word).
+        unsafe { std::ptr::write_bytes(data.add(footprint.Offset as usize), 0, len) };
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -479,11 +575,7 @@ impl Drop for Staging {
         // buffer any more: it waits in the pool for a texture of its class.
         if self.class != 0 {
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-            let (classes, idle) = &mut *pool;
-            if *idle + self.class <= pool_most() {
-                *idle += self.class;
-                classes.entry(self.class).or_default().push(Idle(self.buffer.clone(), self.data));
-            }
+            pool.give(self.class, self.buffer.clone(), self.data);
         }
     }
 }
@@ -782,21 +874,18 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
-        // A buffer from the pool holds another texture's bytes: until
-        // something is detiled into it, it reads as a new one would, zeros
-        // (the copy of a texture not there yet, or not readable now).
+        // A buffer from the pool holds another texture's bytes: until a
+        // detile into it has gone through whole, it reads as a new one
+        // would, zeros (the copy of a texture not there yet, not readable
+        // now, or whose detile failed partway).
         if self.recycled.load(Relaxed) {
             // Under the lock detiling takes, so that one on another thread
             // is not zeroed over.
             let _held = self.last.lock().unwrap_or_else(|e| e.into_inner());
-            if !self.detiled.load(Relaxed) && self.recycled.swap(false, Relaxed) {
-                for (footprint, &rows) in self.footprints.iter().zip(&self.rows) {
-                    let f = footprint.Footprint;
-                    let len = f.RowPitch as usize * rows as usize * f.Depth as usize;
-                    // SAFETY: the subresource's part of the mapped staging
-                    // buffer, written only under `last`'s lock.
-                    unsafe { std::ptr::write_bytes(self.data.add(footprint.Offset as usize), 0, len) };
-                }
+            if zero_first(&self.recycled, &self.detiled) {
+                // SAFETY: the mapped staging buffer, with these parts;
+                // written only under `last`'s lock.
+                unsafe { zero_parts(self.data, &self.footprints, &self.rows) };
             }
         }
         let preparing = &crate::host::PREPARING;
@@ -1017,7 +1106,6 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.detiled.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1043,6 +1131,9 @@ impl Staging {
                 return;
             }
         }
+        // Only whole: a detile that failed partway leaves a buffer from
+        // the pool to be zeroed (`zero_first`), not part another texture's.
+        self.detiled.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1399,7 +1490,13 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
 
 #[cfg(test)]
 mod pool_tests {
-    use super::pool_class;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    use super::{Pool, pool_class, zero_first, zero_parts};
 
     #[test]
     fn a_class_holds_its_size_with_at_most_an_eighth_more() {
@@ -1418,6 +1515,120 @@ mod pool_tests {
         assert_eq!(pool_class(1_000_000), pool_class(1_040_000));
         assert_eq!(pool_class(1), pool_class(65_536));
         assert_ne!(pool_class(1 << 20), pool_class(2 << 20));
+    }
+
+    /// An upload buffer of `size` bytes on `device`, mapped, as
+    /// `Host::upload_buffer` makes them.
+    fn upload(device: &ID3D12Device, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of an upload buffer.
+        unsafe {
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer)
+                .ok()?;
+            buffer.as_ref()?.Map(0, None, Some(&mut data)).ok()?;
+        }
+        Some((buffer?, data.cast()))
+    }
+
+    /// The pool on the software adapter: a buffer given back is the one
+    /// taken next for its class, with what the last staging wrote in it;
+    /// one of another class is made; the cap and the off switch keep none.
+    #[test]
+    fn warp_a_staging_buffer_goes_back_to_the_pool_and_is_taken_again() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let address = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let pool = Mutex::new(Pool::new(7 << 19));
+        let made = std::cell::Cell::new(0);
+        let make = |bytes| {
+            made.set(made.get() + 1);
+            upload(&device, bytes)
+        };
+        let (first, data, class, recycled) = Pool::take(&pool, 1_000_000, &make).unwrap();
+        assert_eq!((class, recycled), (pool_class(1_000_000), false));
+        // SAFETY: the buffer is mapped and at least a megabyte.
+        unsafe { std::ptr::write_bytes(data, 0xAA, 1_000_000) };
+        let at = address(&first);
+        assert!(pool.lock().unwrap().give(class, first, data));
+        // The same class: the same buffer, still holding the last bytes.
+        let (again, data, _, recycled) = Pool::take(&pool, 1_040_000, &make).unwrap();
+        assert!(recycled);
+        assert_eq!(address(&again), at);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *data.add(999_999) }, 0xAA);
+        assert_eq!(made.get(), 1);
+        // Another class: made anew.
+        let (other, other_data, other_class, recycled) = Pool::take(&pool, 3 << 20, &make).unwrap();
+        assert!(!recycled);
+        assert_eq!(made.get(), 2);
+        // The cap (3.5 MiB): the 3 MiB buffer is kept, then the megabyte's is not.
+        let mut p = pool.lock().unwrap();
+        assert!(p.give(other_class, other, other_data));
+        assert!(!p.give(class, again, data));
+        assert_eq!(p.idle, other_class);
+        // Cleared (a lost device): nothing idle, the next is made.
+        p.clear();
+        assert_eq!(p.idle, 0);
+        drop(p);
+        let (_, _, _, recycled) = Pool::take(&pool, 3 << 20, &make).unwrap();
+        assert!(!recycled);
+        assert_eq!(made.get(), 3);
+        // Off: buffers of the asked size, class 0, never kept.
+        let off = Mutex::new(Pool::new(0));
+        let (b, d, class, recycled) = Pool::take(&off, 100_000, &make).unwrap();
+        assert_eq!((class, recycled), (0, false));
+        // SAFETY: a live buffer.
+        assert_eq!(unsafe { b.GetDesc() }.Width, 100_000);
+        assert!(!off.lock().unwrap().give(pool_class(100_000), b, d));
+    }
+
+    /// A buffer from the pool is zeroed at its first refresh unless a
+    /// detile went through whole, once, and only where its parts lie.
+    #[test]
+    fn warp_a_recycled_staging_is_zeroed_at_its_first_refresh_only() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let (buffer, data) = upload(&device, 1 << 16).unwrap();
+        let _alive = buffer;
+        // SAFETY: the mapped buffer is 64 KiB.
+        unsafe { std::ptr::write_bytes(data, 0xAA, 1 << 16) };
+        let part = |offset: u64, pitch: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { RowPitch: pitch, Depth: 1, Width: 1, Height: 1, ..Default::default() },
+        };
+        let footprints = [part(0, 256), part(4096, 256)];
+        let rows = [4, 2];
+        // A fresh buffer, or a recycled one detiled whole: not zeroed.
+        assert!(!zero_first(&AtomicBool::new(false), &AtomicBool::new(false)));
+        let recycled = AtomicBool::new(true);
+        assert!(!zero_first(&recycled, &AtomicBool::new(true)));
+        // Recycled and not detiled (nothing there, or a detile that failed
+        // partway): zeroed once.
+        let detiled = AtomicBool::new(false);
+        assert!(zero_first(&recycled, &detiled));
+        assert!(!zero_first(&recycled, &detiled));
+        // SAFETY: both parts lie in the mapped buffer.
+        unsafe { zero_parts(data, &footprints, &rows) };
+        // SAFETY: reads of the mapped buffer.
+        let byte = |at: usize| unsafe { *data.add(at) };
+        assert!((0..1024).all(|i| byte(i) == 0));
+        assert_eq!(byte(1024), 0xAA);
+        assert!((4096..4096 + 512).all(|i| byte(i) == 0));
+        assert_eq!(byte(4096 + 512), 0xAA);
     }
 }
 

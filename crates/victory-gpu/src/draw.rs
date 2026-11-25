@@ -957,6 +957,8 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
+        let mut at = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -974,9 +976,13 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase(0, &mut at);
         if !self.bind(list, p, false) {
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let mut at = std::time::Instant::now();
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1043,6 +1049,8 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase(1, &mut at);
         true
     }
 
@@ -1061,8 +1069,12 @@ impl State {
             self.after_our_pass(list);
         }
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let mut at = std::time::Instant::now();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase(2, &mut at);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1116,8 +1128,12 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase(3, &mut at);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase(4, &mut at);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1240,6 +1256,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase(5, &mut at);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -1268,6 +1286,8 @@ impl State {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase(6, &mut at);
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();

@@ -969,6 +969,78 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 }
 
 /// A list call on this thread that began at `started` has returned.
+/// Diagnostics: list-call time by the list call it was (the call site in
+/// `list.rs` that took the draw state), summed over all recording threads;
+/// a table of the costliest every 20 s ([`recorded_at`]).
+static SITES: Mutex<Option<std::collections::HashMap<usize, (&'static std::panic::Location<'static>, u64, u64)>>> =
+    Mutex::new(None);
+
+thread_local! {
+    /// This thread's [`SITES`] additions not yet added, and their time.
+    static SITES_HERE: std::cell::RefCell<(std::collections::HashMap<usize, (&'static std::panic::Location<'static>, u64, u64)>, u64)> =
+        std::cell::RefCell::new((std::collections::HashMap::new(), 0));
+}
+
+/// Diagnostics: time in the parts of preparing a draw or dispatch, summed
+/// over all threads (nanoseconds): 0 pipeline lookup, 1 vertex and index
+/// buffers and target states, 2 textures picked by index, 3 heaps, root
+/// signature and pipeline (and the root views of earlier stages), 4
+/// descriptor tables, 5 user data and root constant and shader views, 6
+/// root unordered access views.
+static PHASES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Adds the time since `*at` to phase `n` and restarts `*at`.
+pub(crate) fn phase(n: usize, at: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    PHASES[n].fetch_add((now - *at).as_nanos() as u64, Relaxed);
+    *at = now;
+}
+
+pub(crate) fn recorded_at(started: std::time::Instant, site: &'static std::panic::Location<'static>) {
+    let ns = started.elapsed().as_nanos() as u64;
+    let full = SITES_HERE.with(|h| {
+        let mut h = h.borrow_mut();
+        let e = h.0.entry(std::ptr::from_ref(site) as usize).or_insert((site, 0, 0));
+        e.1 += ns;
+        e.2 += 1;
+        h.1 += ns;
+        if h.1 < 5_000_000 {
+            return None;
+        }
+        h.1 = 0;
+        Some(std::mem::take(&mut h.0))
+    });
+    let Some(here) = full else { return };
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let mut all = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(Default::default);
+    for (k, (s, t, n)) in here {
+        let e = all.entry(k).or_insert((s, 0, 0));
+        e.1 += t;
+        e.2 += n;
+    }
+    let now = now_us();
+    if now < LAST.load(Relaxed) + 20_000_000 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let mut rows: Vec<_> = all.values().copied().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = rows.iter().map(|r| r.1).sum::<u64>().max(1);
+    let table: Vec<String> = rows
+        .iter()
+        .take(12)
+        .map(|(s, t, n)| format!("list.rs:{} {:.0}% {:.1} us x{}", s.line(), *t as f64 * 100.0 / total as f64, *t as f64 / 1e3 / (*n).max(1) as f64, n))
+        .collect();
+    tracing::info!("list-call time by call, since the last table: {}", table.join("; "));
+    let phases: Vec<String> = PHASES.iter().map(|p| format!("{:.0}", p.swap(0, Relaxed) as f64 / 1e6)).collect();
+    tracing::info!(
+        "draw preparing since the last table, ms (pipeline lookup, vertex/index/targets, indexed textures, heaps/root/pso, tables, user data + root CBV/SRV, root UAVs): {}",
+        phases.join(", ")
+    );
+    all.clear();
+}
+
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);

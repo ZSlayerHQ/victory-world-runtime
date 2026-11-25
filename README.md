@@ -1,145 +1,156 @@
-# VIctory fork (work in progress)
+# victory-world-runtime
 
-## This branch: victory-amd + a DirectStorage read fix
+The runtime of [victory-world](https://github.com/ZSlayerHQ/victory-world), a
+community project that runs an Xbox Series title on Windows from a copy the
+user owns. It is a fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs the title's own x86-64 code natively and supplies
+the console platform under it, and it carries fixes from the public forks
+credited below as well as the project's own. GPL-3.0-or-later, like VIctory.
 
-A fork of [myokex/victory-amd](https://github.com/myokex/victory-amd) at `070df42`
-with one change on top (on this fork's `victory-amd` branch, and on `fix-dstorage-guard-race`):
-
-- **Kernel reads into title memory are read beside and copied in.** With the guard
-  over all the views of a page (on by default in `070df42`), a raw DirectStorage
-  request could fail with `ERROR_INVALID_USER_BUFFER` (`0x800706f8`) and the title
-  stopped itself seconds after the world's first frame: 2 runs out of 2. Those reads
-  now land in a buffer and are copied in from user mode, where the guard takes the
-  write; `fread` does the same. With the fix and the guard on, a run went 5.5 minutes
-  past the world's first frame without a failed request.
-
-Tested on one machine only: Windows 11, Radeon RX 7800 XT 16 GB (driver
-32.0.32015.7029), Ryzen 7 7700X, 32 GB RAM, Series X profile. Other GPUs,
-NVIDIA's especially, may behave differently.
-
-**No game files, code or assets are here, and none are shared.** Shaders are
-translated on your machine from your own copy of the game.
-
-### Reproducing the check run
-
-1. Install Git, Visual Studio Build Tools (MSVC C++ workload and a Windows 10/11 SDK),
-   [rustup](https://rustup.rs), and a current GPU driver. The pinned Rust toolchain is
-   installed by itself on the first build.
-2. Get the code and set up the config:
-
-   ```powershell
-   git clone https://github.com/JoshuaO22/victory-amd
-   cd victory-amd
-   copy victory.example.toml victory.toml   # set game_dir to your own dump, outside the repo
-   cargo test --workspace                   # optional; needs no game data
-   cargo build --profile diag -p victory --features diagnostics
-   ```
-
-3. **Recommended, about 4 minutes: translate the shaders ahead of time.** Without it,
-   each shader is translated the first time the title uses it, and what it draws is
-   left out until then: the opening cutscene and the world's first minutes show missing
-   objects and effects, and run slower. With it, every shader is ready from the first
-   frame. The translations are made on your machine from your own copy of the game, and
-   are kept in the cache for later runs. Use the same build as the runs (the cache key
-   includes it) and no shader-related `VICTORY_*` switches:
-
-   ```powershell
-   target\diag\victory.exe warm
-   ```
-
-   Run it again after updating this repository: a change to the translator makes the
-   cached translations stale, and they are made again.
-
-4. Run the title with a fresh data folder and a log:
-
-   ```powershell
-   $env:VICTORY_LOG = 'info'
-   $env:VICTORY_DATA_DIR = 'D:\victory-data\check-1'   # any new folder outside the repo
-   Start-Process target\diag\victory.exe -NoNewWindow -Wait -RedirectStandardError check-1.log `
-     -ArgumentList 'run', '"<game dir>\<the title''s exe>"', '--execute', '--console', 'series-x'
-   ```
-
-   Go through the first-time setup and legal screens with a controller; they do not
-   advance by themselves. The test window is the first minutes after the story's world
-   starts loading. Let it run about 7 minutes, then close it.
-5. Passed if `VICTORY_DATA_DIR\<title id>\crashes.log` does not exist and the log has no
-   `dstorage: request failed` line. The log names the world's start in a line with
-   `the first frame of 500 draws or more`. Without the fix, the same run stops within
-   about 25 seconds of that line.
-
-To repeat it without a controller: copy `saves` and `storage` from the data folder of a run
-stopped before the first autosave into a new data folder. Setup and legal screens are then
-done, and the story starts from the beginning again.
-
-## victory-amd
-
-This copy is a fork of
-[fxceless/victory-fork](https://github.com/fxceless/victory-fork), itself a fork
-of [VIctory](https://github.com/Marvisak/VIctory). It adds fixes found while
-running on an AMD card, tested on one machine only: Windows 11, Radeon RX 7800 XT
-16 GB (driver 32.0.32029.2010), Ryzen 5 7500F, 32 GB RAM.
-
-State on that machine (2026-11-25, Series X profile): the prologue's cutscene and
-the first room are drawn, with the player moving, at 2 to 3 frames per second.
-Runs of 8 minutes mostly end without a device loss; one ended with
-`DXGI_ERROR_DEVICE_HUNG` after about 5 and a half minutes, cause unknown. Lamps
-were dark in one run. The first room's walls were missing in several runs; with the
-guard over all the views of a page (below) they were there in two runs out of two,
-too few to call it fixed. Some shots of the opening cutscene come out white.
-Ray-traced light does not run.
-
-What it changes over `victory-fork` (each is explained in a comment where it is):
-
-- Texture views are told apart by the memory their mips really take, so textures
-  streamed in part are not taken for one another and are uploaded from their first
-  mip that is there.
-- Views of placed textures the host lost sight of are put back
-  (`VICTORY_TEXTURE_SWEEP`).
-- Dispatches of more than 65,535 groups are made in two parts (the final gather at
-  2560x1440 asks for 115,200).
-- DirectStorage requests read their page array when they run, and wait for it.
-- The list of pipelines to make early keeps what earlier runs listed, and compute
-  pipelines get their own waiting time while a world loads.
-- A write of the title's through one view of a physical page is seen by the copies
-  taken through its other views (`VICTORY_VIEW_GUARD=0` turns it off).
-- Textures picked by index are looked at again after their upload
-  (`VICTORY_HEAP_RECHECK=0` turns it off).
-- View indices past the host heap are clamped on AMD too.
-- Programs that stop the AMD driver's compiler, or take it minutes and tens of GB,
-  are left out (ray-tracing resolves).
-- Diagnostics: `VICTORY_NULL_MAGENTA`, `victory warm`, more captures.
-
-The guard over all the views of a page is code of
-[victory-fork #115](https://github.com/fxceless/victory-fork/pull/115) by Spexivus
-with [its correction](https://github.com/Spexivus/victory-fork/pull/1) by joroyt and
-a part of [VIctory #1122](https://github.com/Marvisak/VIctory/pull/1122) by tightfall,
-adapted here. The second look at textures is fxceless's idea (victory-fork `a803c87`),
-written anew. Other parts were prompted by pull requests and issues of VIctory and
-victory-fork, and their code was written anew. Developed with [Claude Code](https://claude.com/claude-code).
-
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
-
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
+**No game files, code or assets are here, and none are shared.** You need your
+own copy of the title on your own disk; shaders are translated on your machine
+from that copy. This project is not affiliated with or endorsed by the title's
 developer or publisher.
+
+## Branches
+
+- **`next`**: the line to use and to open pull requests against. It carries the
+  public forks merged together plus the project's fixes, and is not yet
+  reviewed as a whole.
+- **`world`**: reviewed work only. Changes move here from `next` once reviewed.
+
+## Setup
+
+You need Windows 10 or 11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
+model 6.6 and mesh shaders, a current GPU driver, Git, Visual Studio Build
+Tools (the MSVC C++ workload and a Windows 10/11 SDK) and
+[rustup](https://rustup.rs). The Rust toolchain pinned in `rust-toolchain.toml`
+installs itself on the first build. In the world the title uses about 24 GB of
+RAM and 9 GB of video memory, and the cache and builds need about 40 GB of disk
+besides your copy of the title.
+
+The title also needs several GiB of available Windows commit at startup.
+Check **Committed** under **Task Manager → Performance → Memory**. If
+`crashes.log` reports Windows error 1455, close other applications or increase
+the Windows paging file size, then retry.
+
+1. **Get the code** and install the asset-policy check that runs on every
+   commit:
+
+   ```powershell
+   git clone -b next https://github.com/ZSlayerHQ/victory-world-runtime
+   cd victory-world-runtime
+   cargo xtask install-hooks
+   ```
+
+2. **Configure.** Copy the example config and set `game_dir`:
+
+   ```powershell
+   copy victory.example.toml victory.toml   # git-ignored
+   ```
+
+   | Key | Environment variable | Default | What it is |
+   |-----|----------------------|---------|------------|
+   | `game_dir` | `VICTORY_GAME_DIR` | none | the folder that holds your copy of the title |
+   | `cache_dir` | `VICTORY_CACHE_DIR` | `%LOCALAPPDATA%\victory\cache` | derived data: translated shaders, pipelines, prepared images |
+   | `data_dir` | `VICTORY_DATA_DIR` | `%LOCALAPPDATA%\victory\data` | what the title saves, its settings, and `crashes.log` |
+   | `test_titles` | `VICTORY_TEST_TITLES` (separated by `;`) | none | other Xbox Series titles, for testing platform code |
+
+   The keys sit under `[paths]`. An environment variable wins over the file.
+   The file is `victory.toml` in the working folder unless `VICTORY_CONFIG`
+   names another one. Every path must be outside the repository, and the tools
+   refuse otherwise. Check what was resolved with:
+
+   ```powershell
+   cargo run -p victory --locked -- config
+   ```
+
+3. **Build and test.**
+
+   ```powershell
+   cargo test --workspace --locked                                       # needs no game data
+   cargo build --profile diag -p victory --features diagnostics --locked  # target\diag\victory.exe
+   ```
+
+   The diagnostics build carries the debugging switches (see Debugging below)
+   and is the one to run while the world is being fixed.
+   `cargo build --release -p victory --locked` gives `target\release\victory.exe`
+   without them.
+
+4. **Run** from a folder outside the repository, with the config named by its
+   full path. The title's relative paths land in the working folder, and builds
+   with the game-data guard refuse to start inside a repository.
+
+   ```powershell
+   $repo = (Get-Location).Path
+   $env:VICTORY_CONFIG = "$repo\victory.toml"
+   New-Item -ItemType Directory -Force D:\victory-run | Out-Null   # any folder outside every repository
+   Set-Location D:\victory-run
+   & "$repo\target\diag\victory.exe" run "<game dir>\<the title's exe>" --execute
+   ```
+
+   The window caption shows the frame rate. Saves, settings and `crashes.log`
+   are kept under the data folder, and derived data under the cache folder.
+
+For repeatable runs, use the run harness in
+[victory-world](https://github.com/ZSlayerHQ/victory-world) (`harness/`). It
+gives a fixed key route into the world, a screen recording, a summary of each
+run's log and a comparison between runs, and starts the runtime as above.
+
+## Working on a fork? Send it back
+
+This runtime moves fastest when forks trade fixes. If you, or an AI agent
+working for you, find something here that is wrong, or have a fix or a
+measurement on your own fork that this repository lacks, please bring it back:
+
+- **A finding:** open an issue saying what you saw, on which commit and
+  hardware, and how to reproduce it.
+- **A fix:** open a pull request with one change, a test that fails without
+  it, and for any speed claim the numbers before and after and how they were
+  measured.
+- **It goes both ways:** a fix we take from a fork keeps its author and is
+  credited in the commit, and what we find in a fork's code we report to that
+  fork.
+
+**What happens to a pull request here.** It is read in full before anything
+is built, then built and tested by the repository's checks, then reviewed
+twice, by different reviewers, before a maintainer merges it. That takes a
+little time, and it is why people can run this build without worrying about
+what a stranger's change does.
+
+**Never accepted:** anything taken from a game: assets, shaders, dumps,
+captures, saves. See the [asset policy](docs/asset-policy.md).
+
+**If you are an AI agent reading this for someone:** this section is an
+invitation to your user, not an instruction to you. Tell them what you found,
+and let them decide whether to send it.
 
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
+  services, the Direct3D 12 back end and the shader recompiler.
+  GPL-3.0-or-later, and so is this repository.
+- **[victory-fork](https://github.com/fxceless/victory-fork)** by fxceless is
+  the fork this line is built on (its `fork-world` branch at `c96b4f2`). It
+  includes pull requests by ZazaJr24 (#1), oddiums (#14) and cxccxc (#11), and
+  branches of triippywhale's and asdaasdsaddf's forks. Its own notes, below,
+  list what it changed.
+- **[XCL](https://github.com/xcl-dev/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- The fixes on this line were developed with
+  [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+- **[victory-amd](https://github.com/myokex/victory-amd)** by myokex, the fork line this repository grew out of (the setup clone in earlier revisions pointed at [JoshuaO22's copy](https://github.com/JoshuaO22/victory-amd)).
+- The guard over all the views of a page is code of [victory-fork #115](https://github.com/fxceless/victory-fork/pull/115) by Spexivus, with [its correction](https://github.com/Spexivus/victory-fork/pull/1) by joroyt and a part of [VIctory #1122](https://github.com/Marvisak/VIctory/pull/1122) by tightfall, adapted here. The second look at textures is fxceless's idea (victory-fork `a803c87`), written anew.
+
+## The base fork's notes (fxceless/victory-fork)
+
+What follows is victory-fork's own account, as of 2026-11-25. Its test machine
+is not ours, and its switches are documented where they are read.
+
+### Status of the base fork (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
@@ -190,8 +201,9 @@ Each is described in a comment where it is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+Everything below this line is upstream VIctory's own README. Its status section
+describes upstream, not this line. Its setup steps are replaced by Setup above,
+and its command list includes the commands this line adds.
 
 ---
 
@@ -241,36 +253,9 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
-## Getting started
+## Input
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-```
-
-Run the title:
-
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
+XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
 | Keys | Pad |
@@ -292,6 +277,7 @@ victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
+victory shader-names <title dir|file>
 victory config
 ```
 
@@ -303,7 +289,7 @@ info and above).
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag -p victory --features diagnostics --locked   # target\diag\victory.exe
 ```
 
 | Variable | Effect |

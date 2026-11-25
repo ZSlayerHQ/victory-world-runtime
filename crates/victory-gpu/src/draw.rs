@@ -1684,6 +1684,17 @@ impl State {
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
+        // The long budget only while the queue is long (the title's load,
+        // where it bakes its characters once for the run: 10,000-15,000
+        // slots due at its first bake draws, run b15); a bake in play
+        // (characters coming into view, ~16 bake draws in 3.5 minutes,
+        // 170-280 slots due) gets at most the usual 1.5 s, so a larger
+        // `VICTORY_BAKE_TEXTURES_MS` costs no hitches in play.
+        let bake_ms = if HEAP_TEXTURES_QUEUE[0].load(Ordering::Relaxed) > 2_000 {
+            bake_ms
+        } else {
+            bake_ms.min(1_500)
+        };
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }

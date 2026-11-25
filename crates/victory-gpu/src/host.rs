@@ -2118,6 +2118,21 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
     *ranges = out;
 }
 
+/// Whether shaders may write `[from, to)` of title memory before `list`
+/// runs and its bytes are back in title memory: shaders of flights in the
+/// air ([`late`]), or of `list` itself so far. A title buffer copy there
+/// done at submission would wait for the flights, or copy what was there
+/// before the list's own shaders ran.
+pub(crate) fn shaders_may_write(list: &HostList, from: usize, to: usize) -> bool {
+    if late() && touches(&line().written, from, to) {
+        return true;
+    }
+    list.deferred()
+        .copies
+        .iter()
+        .any(|s| matches!(s, Step::GpuWrite(_, a, l) if *a < to && from < *a + *l))
+}
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {

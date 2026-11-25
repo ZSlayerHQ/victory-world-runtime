@@ -805,6 +805,69 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether title buffer copies whose bytes shaders may be writing are done
+/// by the card (`VICTORY_CARD_COPY`, on by default; `0`: all at
+/// submission, as before).
+#[cfg(windows)]
+fn card_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPY").is_none_or(|v| v != "0"))
+}
+
+/// A title buffer copy of `len` bytes from `src` to `dst` (title memory)
+/// done by the card, in the list's order, between the two buffers' host
+/// copies, when shaders may write either range before the list runs
+/// ([`crate::host::shaders_may_write`]): flights in the air, or the list's
+/// own shaders. The destination's range is copied back into title memory
+/// once the list has run, as shader writes are. True if it was recorded.
+///
+/// At submission the copy waited for every flight that may write either
+/// range to land (run d17: once a frame, ~100 ms, the card's whole queue),
+/// and a copy behind the list's own shader writes took the bytes from
+/// before them. On the console the card does the copy when it reaches it.
+#[cfg(windows)]
+fn card_copy(list: &crate::host::HostList, dst: usize, src: usize, len: u64) -> bool {
+    if len == 0 || !card_copies() {
+        return false;
+    }
+    let n = len as usize;
+    if !crate::host::shaders_may_write(list, src, src + n) && !crate::host::shaders_may_write(list, dst, dst + n) {
+        return false;
+    }
+    let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len), crate::shadow::find(dst as u64, len)) else {
+        return false;
+    };
+    // One buffer cannot be source and destination at once; title memory in
+    // place is written behind write watching's back.
+    if std::sync::Arc::ptr_eq(&from, &to) || from.in_place() || to.in_place() {
+        return false;
+    }
+    from.refresh(list, src as u64, len);
+    to.refresh(list, dst as u64, len);
+    to.gpu_writes(list, dst as u64, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if k.is_power_of_two() {
+            tracing::info!(k, len, src = format_args!("{src:#x}"), dst = format_args!("{dst:#x}"), "title buffer copies done by the card");
+        }
+    }
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    // SAFETY: the same layout as the host's barrier.
+    let wait = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list and two live buffers, the ranges inside them.
+    // The barriers: shader writes before it are done before the copy reads,
+    // and the copy is done before what follows reads (buffers have no
+    // tracked state; the title's own buffer barriers wait the same way).
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_ref(&wait));
+        list.list.CopyBufferRegion(&to.buffer, to.offset(dst as u64), &from.buffer, from.offset(src as u64), len);
+        list.list.ResourceBarrier(std::slice::from_ref(&wait));
+    }
+    true
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -819,6 +882,9 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if card_copy(list, to as usize, from as usize, len) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]

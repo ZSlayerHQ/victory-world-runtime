@@ -1679,6 +1679,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether this is title memory in place, not a copy ([`Shadow::placed`]).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id

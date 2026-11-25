@@ -1179,21 +1179,39 @@ impl HostHeap {
         let mut unmade = Vec::new();
         {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            // The memory is the title's, and a heap may be larger than what
-            // of it is there: asked once per page.
-            let mut page = (u64::MAX, false);
+            // The title can unmap heap pages during a scan. Read through the
+            // kernel into a page buffer so an absent page only skips its slots.
+            const PAGE_BYTES: usize = 4096;
+            const RECORD_BYTES: usize = 12;
+            let mut page = [0; PAGE_BYTES];
+            let mut page_at = u64::MAX;
+            let mut readable = false;
             for index in slots {
                 let Some(handle) = handle(index) else {
                     break;
                 };
-                if page.0 != handle >> 12 {
-                    page = (handle >> 12, crate::texture::committed(handle as *const u8, 12));
-                }
-                if !page.1 {
-                    continue;
-                }
-                // SAFETY: a descriptor slot of the title's heap, there.
-                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let base = handle & !(PAGE_BYTES as u64 - 1);
+                let offset = (handle - base) as usize;
+                let mut crossing = [0; RECORD_BYTES];
+                let record = if offset <= PAGE_BYTES - RECORD_BYTES {
+                    if base != page_at {
+                        page_at = base;
+                        readable = crate::host::read_into(base as *const u8, &mut page);
+                    }
+                    if !readable {
+                        continue;
+                    }
+                    &page[offset..offset + RECORD_BYTES]
+                } else {
+                    if !crate::host::read_into(handle as *const u8, &mut crossing) {
+                        continue;
+                    }
+                    &crossing
+                };
+                let [tag, i, generation] = std::array::from_fn(|word| {
+                    let at = word * size_of::<u32>();
+                    u32::from_le_bytes(record[at..at + size_of::<u32>()].try_into().unwrap())
+                });
                 if tag != VIEW_TAG || generation >> super::KIND_SHIFT == super::CONSTANT {
                     continue;
                 }

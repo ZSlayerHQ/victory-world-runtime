@@ -16,6 +16,12 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1, false)
+}
+
+/// [`build`], with `nonuniform` heap accesses that take each lane's own
+/// index, and wave operations or not.
+fn build_with(words: &[u32], buffers: bool, nonuniform: u32, wave_ops: bool) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,9 +77,9 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    // As many accesses with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
+    assert_eq!(lowered.wave_ops, wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -247,5 +253,59 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+/// The console compiler's size of a texture picked by index without a read
+/// of it (the title's puddle detection): it loads the entry's eight dwords
+/// and takes width - 1 from dword 1 bits 30-31 and dword 2 bits 0-13, and
+/// height - 1 from dword 2 bits 14-29. Here the entry is 1, by an offset
+/// computed from the first lane's (lane & 1) * 32 + 32; each lane stores
+/// (height << 16) | width.
+const SIZE_FROM_DESCRIPTOR_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    0x360E_0081, // v_and_b32 v7, 1, v0
+    0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E18_0507, // v_readfirstlane_b32 s12, v7
+    0x810C_A00C, // s_add_i32 s12, s12, 32
+    0xF40C_0502,
+    0x1800_0000, // s_load_dwordx8 s[20:27], s[4:5], s12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x900C_9E15, // s_lshr_b32 s12, s21, 30
+    0x8F14_8216, // s_lshl_b32 s20, s22, 2
+    0x938F_FF16,
+    0x0010_000E, // s_bfe_u32 s15, s22, 14 (16 bits)
+    0x8814_140C, // s_or_b32 s20, s12, s20
+    0x8714_FF14,
+    0x0000_FFFF, // s_and_b32 s20, s20, 0xffff
+    0x810F_810F, // s_add_i32 s15, s15, 1
+    0x8114_8114, // s_add_i32 s20, s20, 1
+    0x8F0F_900F, // s_lshl_b32 s15, s15, 16
+    0x8814_0F14, // s_or_b32 s20, s20, s15
+    0x7E18_0214, // v_mov_b32 v12, s20
+    0xE070_1000,
+    0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_texture_size_read_from_its_descriptor_bits_is_the_host_views() {
+    let shader = build_with(SIZE_FROM_DESCRIPTOR_WAVE32, false, 0, true);
+    let small = [[0.0f32; 4]];
+    let five_by_three = [[0.0f32; 4]; 15];
+    let views = [
+        View::Texture(1, 1, &small),
+        View::Texture(5, 3, &five_by_three),
+        View::RawUav(32),
+    ];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, words) in results {
+        assert_eq!(words, vec![3 << 16 | 5; 32], "{label}");
     }
 }

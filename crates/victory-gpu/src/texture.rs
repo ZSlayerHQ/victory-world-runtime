@@ -60,6 +60,86 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The pool's size class of `buffer` ([`pooled_upload`]; 0: not from
+    /// the pool, released with the staging), whether the buffer came back
+    /// from an earlier staging (it holds that texture's bytes, not zeros),
+    /// and whether anything was detiled into it since.
+    class: u64,
+    recycled: std::sync::atomic::AtomicBool,
+    detiled: std::sync::atomic::AtomicBool,
+}
+
+/// Whether staging buffers are kept for later textures when their staging
+/// goes, up to this many idle megabytes (`VICTORY_STAGING_POOL_MB`, 512; 0:
+/// every staging makes and releases its own, as before).
+///
+/// Every texture upload made a committed upload buffer and released it
+/// once its list had run: 54,279 of them and 21 GB in one 300 s run on
+/// fxceless `310c6eb`, most while the queue of textures picked by index
+/// catches up, each made on the thread that records the frame (0.3-0.4 ms
+/// apiece on an RTX 5070). With the pool about half of them are taken from
+/// it, and the catching-up pass, which runs to its time budget, brings in
+/// more in that time: 73,000 textures uploaded 2:35 after start against
+/// 54,000, and 1,575 waiting at 4:55 against 4,280 (one 300 s run each,
+/// Ryzen 5 5600X).
+fn pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(512)
+            << 20
+    })
+}
+
+/// The size a staging buffer of `size` bytes is made with when pooled: up
+/// to an eighth of its power of two more (and 64 KiB at least), so that
+/// textures of near sizes share buffers.
+fn pool_class(size: u64) -> u64 {
+    let size = size.max(1 << 16);
+    let step = (size.next_power_of_two() / 8).max(1 << 16);
+    size.div_ceil(step) * step
+}
+
+/// An idle pooled buffer and its mapping.
+struct Idle(ID3D12Resource, *mut u8);
+// SAFETY: the mapping is only written by the staging that takes it.
+unsafe impl Send for Idle {}
+
+/// Idle staging buffers by size class, and their bytes.
+static POOL: Mutex<(std::collections::BTreeMap<u64, Vec<Idle>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+
+/// Since the start: staging buffers taken from the pool, made new for it,
+/// and the microseconds the made ones took.
+pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A staging buffer of at least `size` bytes, its mapping, its class (0:
+/// not pooled), and whether it held another texture's bytes.
+fn pooled_upload(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let host = host()?;
+    if pool_most() == 0 {
+        let (buffer, data) = host.upload_buffer(size)?;
+        return Some((buffer, data, 0, false));
+    }
+    let class = pool_class(size);
+    {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (classes, idle) = &mut *pool;
+        if let Some(Idle(buffer, data)) = classes.get_mut(&class).and_then(Vec::pop) {
+            *idle -= class;
+            POOL_STATS[0].fetch_add(1, Relaxed);
+            return Some((buffer, data, class, true));
+        }
+    }
+    let began = std::time::Instant::now();
+    let (buffer, data) = host.upload_buffer(class)?;
+    POOL_STATS[1].fetch_add(1, Relaxed);
+    POOL_STATS[2].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    Some((buffer, data, class, false))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -395,6 +475,16 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Lists hold a staging until they have run, so nothing reads the
+        // buffer any more: it waits in the pool for a texture of its class.
+        if self.class != 0 {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let (classes, idle) = &mut *pool;
+            if *idle + self.class <= pool_most() {
+                *idle += self.class;
+                classes.entry(self.class).or_default().push(Idle(self.buffer.clone(), self.data));
+            }
+        }
     }
 }
 
@@ -692,6 +782,23 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        // A buffer from the pool holds another texture's bytes: until
+        // something is detiled into it, it reads as a new one would, zeros
+        // (the copy of a texture not there yet, or not readable now).
+        if self.recycled.load(Relaxed) {
+            // Under the lock detiling takes, so that one on another thread
+            // is not zeroed over.
+            let _held = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.detiled.load(Relaxed) && self.recycled.swap(false, Relaxed) {
+                for (footprint, &rows) in self.footprints.iter().zip(&self.rows) {
+                    let f = footprint.Footprint;
+                    let len = f.RowPitch as usize * rows as usize * f.Depth as usize;
+                    // SAFETY: the subresource's part of the mapped staging
+                    // buffer, written only under `last`'s lock.
+                    unsafe { std::ptr::write_bytes(self.data.add(footprint.Offset as usize), 0, len) };
+                }
+            }
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -910,6 +1017,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.detiled.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1254,7 +1362,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, class, recycled) = pooled_upload(total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1281,9 +1389,36 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        class,
+        recycled: std::sync::atomic::AtomicBool::new(recycled),
+        detiled: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::pool_class;
+
+    #[test]
+    fn a_class_holds_its_size_with_at_most_an_eighth_more() {
+        for size in [1, 4096, 65_536, 65_537, 100_000, 1 << 20, (1 << 20) + 1, 3_000_000, 40 << 20, (64 << 20) - 1] {
+            let class = pool_class(size);
+            assert!(class >= size, "{size}: {class}");
+            assert_eq!(class % (1 << 16), 0, "{size}: {class}");
+            if size > 1 << 19 {
+                assert!(class - size <= size.next_power_of_two() / 8, "{size}: {class}");
+            }
+        }
+    }
+
+    #[test]
+    fn near_sizes_share_a_class() {
+        assert_eq!(pool_class(1_000_000), pool_class(1_040_000));
+        assert_eq!(pool_class(1), pool_class(65_536));
+        assert_ne!(pool_class(1 << 20), pool_class(2 << 20));
+    }
 }
 
 #[cfg(test)]

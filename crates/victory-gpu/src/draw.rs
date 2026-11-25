@@ -1510,7 +1510,24 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        #[cfg(feature = "diagnostics")]
+        let (textures_began, pool_before) =
+            (std::time::Instant::now(), crate::texture::POOL_STATS.each_ref().map(|c| c.load(Ordering::Relaxed)));
         self.heap_textures(list, heap, host);
+        // A pass of 200 ms or more: its texture part and the staging
+        // buffers it took from the pool or made (`texture::pool_most`).
+        #[cfg(feature = "diagnostics")]
+        if started.elapsed().as_millis() >= 200 {
+            let pool = crate::texture::POOL_STATS.each_ref().map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(
+                ms = started.elapsed().as_millis(),
+                textures_ms = textures_began.elapsed().as_millis(),
+                stagings_reused = pool[0] - pool_before[0],
+                stagings_made = pool[1] - pool_before[1],
+                stagings_made_ms = (pool[2] - pool_before[2]) / 1000,
+                "a slow pass over the heap's views"
+            );
+        }
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);

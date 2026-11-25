@@ -64,9 +64,24 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
-/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
-const AHEAD_MAX: usize = (1 << 30) / PAGE;
+/// 8 MB, or `VICTORY_ASK_GAP_MB`. (Gaps it bridges are asked too: their
+/// written pages go to the journal like the others'.)
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let mb: usize = std::env::var("VICTORY_ASK_GAP_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8);
+        (mb << 20) / PAGE
+    })
+}
+/// The most one asking covers (its answer needs 8 bytes per 4 KiB page):
+/// 1 GB, or `VICTORY_ASK_MAX_MB`.
+fn ahead_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let mb: usize = std::env::var("VICTORY_ASK_MAX_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024);
+        (mb.max(1) << 20) / PAGE
+    })
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -100,8 +115,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && pieces[k].0 <= last + ahead_gap()
+            && last.max(pieces[k].1) - first <= ahead_max()
         {
             last = last.max(pieces[k].1);
             k += 1;
@@ -267,12 +282,21 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        // (an asking across more than one reservation: `ask_run` splits it
+        // and asks again)
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::WatchFails, 1);
+            add(C::WatchFailUs, started.elapsed().as_micros() as u64);
+        }
         return false;
     }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
+        add(C::WatchesAhead, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }

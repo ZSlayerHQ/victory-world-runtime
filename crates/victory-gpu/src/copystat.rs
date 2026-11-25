@@ -132,6 +132,12 @@ pub(crate) enum C {
     /// copies could be if only the written 4 KiB pages of a unit went.
     DirtyKernelPages,
     DirtyUnits,
+    /// Of `Watches`: askings for a submission's ranges together (`ask_ahead`,
+    /// `ask_once`); and askings the kernel refused (a range across more than
+    /// one reservation, asked again in halves) with their microseconds.
+    WatchesAhead,
+    WatchFails,
+    WatchFailUs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1075,7 +1081,8 @@ pub(crate) fn log(frames: f64) {
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; written as the kernel tells it: \
-         {:.1} MB in 4 KiB pages, {:.1} MB in 64 KiB units",
+         {:.1} MB in 4 KiB pages, {:.1} MB in 64 KiB units; askings: {:.0} for submissions' ranges \
+         together, {:.0} refused {:.2} ms",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1101,6 +1108,9 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
         mb(c[C::DirtyKernelPages as usize] * 4096.0),
         mb(c[C::DirtyUnits as usize] * 65536.0),
+        c[C::WatchesAhead as usize],
+        c[C::WatchFails as usize],
+        ms(c[C::WatchFailUs as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

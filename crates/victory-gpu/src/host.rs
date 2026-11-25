@@ -39,7 +39,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -3512,6 +3512,9 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    #[cfg(feature = "diagnostics")]
+                    self.queue.ExecuteCommandLists(&crate::gputrace::wrap("sends to card copies", &[Some(list.cast()?)]));
+                    #[cfg(not(feature = "diagnostics"))]
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -3745,6 +3748,9 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                self.queue.ExecuteCommandLists(&crate::gputrace::wrap("relay fetch", &lists));
+                #[cfg(not(feature = "diagnostics"))]
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -3972,6 +3978,9 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    #[cfg(feature = "diagnostics")]
+                    self.queue.ExecuteCommandLists(&crate::gputrace::wrap("fetch at a settle", &[Some(list.cast()?)]));
+                    #[cfg(not(feature = "diagnostics"))]
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -4451,6 +4460,9 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                #[cfg(feature = "diagnostics")]
+                self.queue.ExecuteCommandLists(&crate::gputrace::wrap("flight", &lists));
+                #[cfg(not(feature = "diagnostics"))]
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -4492,6 +4504,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                #[cfg(feature = "diagnostics")]
+                self.queue.ExecuteCommandLists(&crate::gputrace::wrap("submission waited for", group));
+                #[cfg(not(feature = "diagnostics"))]
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self

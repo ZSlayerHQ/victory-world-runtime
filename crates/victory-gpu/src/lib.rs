@@ -59,6 +59,8 @@ mod watch;
 mod readwatch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profiler;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gputrace;
 #[cfg(windows)]
 mod texback;
 

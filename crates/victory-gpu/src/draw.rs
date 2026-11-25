@@ -70,6 +70,9 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// While a bake's pass runs during the load (`State::early_textures`):
+    /// how many due slots it may take, in place of the usual 4,096.
+    static PASS_SLOTS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1690,11 +1693,8 @@ impl State {
         // (characters coming into view, ~16 bake draws in 3.5 minutes,
         // 170-280 slots due) gets at most the usual 1.5 s, so a larger
         // `VICTORY_BAKE_TEXTURES_MS` costs no hitches in play.
-        let bake_ms = if HEAP_TEXTURES_QUEUE[0].load(Ordering::Relaxed) > 2_000 {
-            bake_ms
-        } else {
-            bake_ms.min(1_500)
-        };
+        let loading = HEAP_TEXTURES_QUEUE[0].load(Ordering::Relaxed) > 2_000;
+        let bake_ms = if loading { bake_ms } else { bake_ms.min(1_500) };
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
@@ -1745,7 +1745,14 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
+        // A bake during the load takes the whole queue, not 4,096 slots of
+        // it: at 4,096 a pass its first draws ran with 6,000-9,000 of their
+        // sources missing whatever the time (run b30, 30 s).
+        if bake && loading {
+            PASS_SLOTS.set(Some(32_768));
+        }
         self.heap_textures(list, heap, host);
+        PASS_SLOTS.set(None);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -1889,7 +1896,7 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due(frame, PASS_SLOTS.get().unwrap_or(4096));
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);

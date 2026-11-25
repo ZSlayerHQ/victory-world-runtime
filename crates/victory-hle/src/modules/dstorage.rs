@@ -1113,14 +1113,27 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let result = fill(out).map(drop);
+        // Told again once the bytes have landed: the read and the decoding
+        // run after the notice above, and a texture pass that looked at the
+        // range in between saw it unfilled, with nothing to make it look again.
+        if result.is_ok() {
+            victory_gpu::kernel_will_write(request.destination as usize, len);
+        }
+        return result;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let result = fill(window.bytes()).map(drop);
+        drop(window);
+        // The title's addresses that show these pages saw no write: tell them.
+        if result.is_ok() {
+            super::xmem::written_pages(pages, offset, len);
+        }
+        return result;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1143,6 +1156,8 @@ fn into_destination(
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
+        // The title's addresses that show these pages saw no write: tell them.
+        super::xmem::written_pages(pages, offset, n);
         Ok(())
     } else {
         let known = super::xmem::pages_known(pages, offset, len);

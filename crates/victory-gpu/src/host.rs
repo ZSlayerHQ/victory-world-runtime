@@ -2246,7 +2246,7 @@ fn blocked_waited(us: u64) {
     }
     b.2 = now;
     let mut rows: Vec<(String, (u64, u64))> = b.0.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
-    rows.sort_by(|x, y| y.1.1.cmp(&x.1.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
     for (key, (n, us)) in rows.iter().take(8) {
         tracing::info!("flights waited for, since the start: {key}: {n} times, {} ms", us / 1000);
     }

@@ -1030,7 +1030,7 @@ pub(crate) fn recorded_at(started: std::time::Instant, site: &'static std::panic
     }
     LAST.store(now, Relaxed);
     let mut rows: Vec<_> = all.values().copied().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     let total: u64 = rows.iter().map(|r| r.1).sum::<u64>().max(1);
     let table: Vec<String> = rows
         .iter()

@@ -310,10 +310,10 @@ pub(crate) fn targets(
 /// title named, made by the workers like any first use (and waited for
 /// within the frame's budget); `None` while it is being made or if the host
 /// refuses it. Each set of formats is made once per pipeline.
-pub(crate) fn for_targets<'a>(
-    p: &'a Pending,
+pub(crate) fn for_targets(
+    p: &Pending,
     targets: windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
-) -> Option<&'a HostPipeline> {
+) -> Option<&HostPipeline> {
     let g = p.graphics.as_deref()?;
     let variant = {
         let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());

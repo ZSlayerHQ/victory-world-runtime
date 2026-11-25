@@ -1686,7 +1686,7 @@ impl Shadow {
     /// two before it.
     pub(crate) fn gpu_written_lately(&self) -> bool {
         let at = self.declared.load(Ordering::Relaxed);
-        at != 0 && crate::frame::current() + 1 <= at + 2
+        at != 0 && crate::frame::current() < at + 2
     }
 
     /// The copy's CPU-side bytes at a title address inside it (for a copy

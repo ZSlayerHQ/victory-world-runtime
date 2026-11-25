@@ -731,7 +731,7 @@ fn v_permlane16_and_x16_pick_lanes_by_the_selects() {
         let mut body = Vec::new();
         body.extend_from_slice(&vop3(op, 5, vgpr(0), sgpr(0), sgpr(1)));
         // v_lshlrev_b32 v6, 2, v0 (VOP2 0x1a)
-        body.push(0x1A << 25 | 6 << 17 | 128 + 2);
+        body.push(0x1A << 25 | 6 << 17 | (128 + 2));
         body.extend_from_slice(&buffer_store_dword_offen(5, 6, 8, 256));
         let shader = build_cs(&body, 32, 0);
         for (lo, hi) in [(0x7654_3210u32, 0xFEDC_BA98u32), (0x0123_4567, 0x89AB_CDEF), (0x3333_0000, 0xF0F0_A5A5)] {

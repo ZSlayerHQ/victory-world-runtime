@@ -278,7 +278,7 @@ fn report(samples: &[(u32, u64, [u64; 3])], names: &mut HashMap<u64, String>) {
     }
     let total = samples.len() as f64;
     let mut rows: Vec<(String, u64)> = by_name.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     let line: Vec<String> = rows
         .iter()
         .take(40)
@@ -286,7 +286,7 @@ fn report(samples: &[(u32, u64, [u64; 3])], names: &mut HashMap<u64, String>) {
         .collect();
     tracing::info!("sampler, all threads ({} samples): {}", samples.len(), line.join(" | "));
     let mut threads: Vec<(u32, u64)> = busy.into_iter().collect();
-    threads.sort_by(|a, b| b.1.cmp(&a.1));
+    threads.sort_by_key(|t| std::cmp::Reverse(t.1));
     for (tid, b) in threads.into_iter().take(10) {
         let Some(map) = chains.get(&tid) else { continue };
         let all: u64 = map.values().sum();

@@ -223,8 +223,11 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// dynamic slot, and the part ([`State::part`]) it was made for.
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, u32)>,
+    /// Which host list of the recording the title's calls go to: 0 after a
+    /// reset, one more at each cut at a wait ([`State::replay`]).
+    part: u32,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -272,6 +275,32 @@ impl State {
         self.tables_gone = true;
     }
 }
+
+/// Whether a descriptor table made fresh for one host list of a recording
+/// is made again, not reused, by a later host list of the same recording
+/// (`VICTORY_CUT_TABLES=1`; off by default: in the boot's A/B, 83 jumps
+/// off and 72 on over 60 s, and no table was ever asked for again across
+/// a cut, so it is not what makes the splash flicker).
+///
+/// A list cut at a wait for a memory value goes on in a new host list
+/// (`crate::list` `cut`), and the draw state goes with it. A fresh table's
+/// constant buffer views show the list's own scratch memory, filled from
+/// title memory when that host list is submitted; the earlier host list
+/// runs first and is reset, and its scratch chunks go to whichever list
+/// next asks. A later part that reused the table read another list's
+/// constants there: the boot and loading screens' layer draws took their
+/// transforms from another recording's layout (two of three frames in
+/// RenderDoc captures 1630/1631: each draw's constants were the draw two
+/// before's, a 512-byte shift; others zeros or garbage). That was the
+/// guess this was made for; the A/B above says otherwise. Kept as a switch:
+/// a reuse across a cut would still read another list's scratch.
+fn cut_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// Fresh tables asked for again in a later part of their recording.
+static CROSS_PART_TABLES: AtomicU64 = AtomicU64::new(0);
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
 /// they are all widened to the whole target. The title's room at
@@ -712,6 +741,8 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        // A new host list: tables made for the one before are not its own.
+        self.part += 1;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -2560,7 +2591,28 @@ impl State {
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // A table made for an earlier host list of this recording (the
+            // list was cut at a wait since): its constant buffer views show
+            // that host list's scratch memory, filled when it was submitted
+            // and given to other lists once it has run ([`cut_tables`]).
+            let cached = match self.fresh_tables.get(&key) {
+                Some(&(first, part)) if part != self.part => {
+                    let n = CROSS_PART_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::info!(
+                            times = n,
+                            made_in_part = part,
+                            asked_in_part = self.part,
+                            remade = cut_tables(),
+                            "a descriptor table made for an earlier part of a list cut at a wait is asked for again"
+                        );
+                    }
+                    (!cut_tables()).then_some(first)
+                }
+                Some(&(first, _)) => Some(first),
+                None => None,
+            };
+            if let Some(first) = cached {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2587,7 +2639,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            self.fresh_tables.insert(key, (first, self.part));
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of

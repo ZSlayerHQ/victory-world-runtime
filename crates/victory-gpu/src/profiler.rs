@@ -55,8 +55,14 @@ fn run() {
     // SAFETY: our own process; symbols from the executable's folder (its
     // .pdb lies beside it) and the default search path.
     unsafe {
-        SymSetOptions(0x0000_0002 | 0x0000_0004); // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
-        SymInitializeW(GetCurrentProcess(), std::ptr::null(), 1);
+        // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_ANYTHING: the
+        // system's dbghelp takes our .pdb for a mismatch without the last.
+        SymSetOptions(0x0000_0002 | 0x0000_0004 | 0x0000_0040);
+        let mut dir = [0u16; 520];
+        let n = windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(std::ptr::null_mut(), dir.as_mut_ptr(), 520) as usize;
+        let end = dir[..n].iter().rposition(|&c| c == 0x5c).unwrap_or(0);
+        dir[end] = 0;
+        SymInitializeW(GetCurrentProcess(), dir.as_ptr(), 1);
     }
     let mut threads: Vec<(u32, HANDLE)> = Vec::new();
     let mut listed = Instant::now() - Duration::from_secs(10);

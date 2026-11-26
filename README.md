@@ -11,6 +11,11 @@ is a fork of
 the public forks credited below as well as this project's own.
 GPL-3.0-or-later, like VIctory.
 
+**What this fork is for.** It is scoped to the title's Xbox Series X version on
+NVIDIA graphics cards, aiming for proper DLSS, ray tracing and frame generation
+on NVIDIA hardware. Other consoles' versions and other vendors' cards are not
+its target. None of the three is in place yet (see where it stands, below).
+
 **It holds no game files.** No game code, assets or shaders are here, and none
 are shared. You need your own copy of the title, from your own console, on your
 own disk; its shaders are translated on your machine from that copy. This

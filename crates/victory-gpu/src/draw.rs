@@ -2597,6 +2597,8 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // (What shaders ask of a typed view in a table: its kind.)
+                host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
